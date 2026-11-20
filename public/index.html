@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Code2Api 控制台</title>
+  <link rel="stylesheet" href="/admin/style.css">
+</head>
+<body>
+  <div id="login" class="login-overlay">
+    <div class="login-card">
+      <div class="brand">
+        <span class="brand-mark">C2</span>
+        <div>
+          <h1>Code2Api</h1>
+          <p>本地 AI 渠道网关</p>
+        </div>
+      </div>
+      <label for="token">管理口令</label>
+      <input id="token" type="password" autocomplete="current-password" placeholder="启动日志中的临时口令 / admin.token">
+      <p id="login-error" class="login-error" hidden></p>
+      <button id="login-btn" class="primary">连接</button>
+      <p class="hint">口令在网关启动日志中打印，也可在 config/config.yaml 的 admin.token 中固定设置。</p>
+    </div>
+  </div>
+
+  <div id="app" class="app" hidden>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">C2</span>
+        <div>
+          <h1>Code2Api</h1>
+          <p id="server-meta" class="muted">—</p>
+        </div>
+      </div>
+      <div class="actions">
+        <span id="conn-status" class="conn off">离线</span>
+        <select id="range" aria-label="统计区间">
+          <option value="1h">近 1 小时</option>
+          <option value="24h" selected>近 24 小时</option>
+          <option value="7d">近 7 天</option>
+          <option value="30d">近 30 天</option>
+          <option value="all">全部历史</option>
+        </select>
+        <button id="refresh-btn">刷新</button>
+        <button id="logout-btn" class="ghost">退出</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="kpis" id="kpis" aria-label="总览指标"></section>
+
+      <section class="panel" id="questions-panel" hidden>
+        <div class="panel-head">
+          <h2>待处理提问</h2>
+          <span class="muted">任务已挂起，回答后自动继续</span>
+        </div>
+        <div id="questions-list" class="questions-list"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>渠道配置</h2>
+          <div class="panel-actions">
+            <span id="channels-note" class="muted"></span>
+            <button id="probe-btn" class="ghost">立即探活</button>
+            <button id="keepalive-btn" class="ghost">触发保活</button>
+            <button id="export-btn" class="ghost">导出数据</button>
+            <button id="add-channel-btn">新增渠道</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>渠道</th>
+                <th>类型</th>
+                <th>状态</th>
+                <th>接入地址</th>
+                <th>密钥</th>
+                <th>模型</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="channels-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>渠道与密钥</h2>
+          <span id="updated-at" class="muted"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>渠道</th>
+                <th>类型</th>
+                <th>状态</th>
+                <th>密钥</th>
+                <th class="num">请求</th>
+                <th class="num" title="上游失败尝试次数（含已自动故障转移的尝试）">失败尝试</th>
+                <th class="num">输入 Tokens</th>
+                <th class="num">输出 Tokens</th>
+                <th class="num">费用</th>
+              </tr>
+            </thead>
+            <tbody id="providers-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>最近请求</h2>
+          <span class="muted">最多显示 100 条</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>端点</th>
+                <th>模型</th>
+                <th>渠道 / 密钥</th>
+                <th>状态</th>
+                <th class="num">Tokens 入 / 出</th>
+                <th class="num">延迟</th>
+                <th class="num">首字节</th>
+                <th>错误</th>
+              </tr>
+            </thead>
+            <tbody id="requests-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>模型目录</h2>
+          <span class="muted">对外模型名 → 上游模型名</span>
+          <input id="model-filter" class="filter-input" placeholder="搜索模型 / 渠道…" autocomplete="off">
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>模型</th>
+                <th>渠道</th>
+                <th>上游名</th>
+                <th class="num">上下文</th>
+                <th>能力</th>
+                <th class="num">价格（入 / 出 每 Mtok）</th>
+              </tr>
+            </thead>
+            <tbody id="models-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="channel-dialog" class="dialog">
+    <div class="dialog-head">
+      <div>
+        <h2 id="channel-dialog-title">新增渠道</h2>
+        <p class="muted">保存后立即生效，无需重启</p>
+      </div>
+      <button id="channel-close" class="ghost">关闭</button>
+    </div>
+    <div class="dialog-body">
+      <div class="form-grid">
+        <label>渠道 ID
+          <input id="ch-id" maxlength="64" autocomplete="off" placeholder="station-a">
+        </label>
+        <label>类型
+          <select id="ch-type">
+            <option value="openai-compatible">openai-compatible</option>
+            <option value="opencode">opencode（CLI 任务级）</option>
+            <option value="mock">mock</option>
+          </select>
+        </label>
+        <label>优先级
+          <input id="ch-priority" type="number" step="1" value="100">
+        </label>
+        <label class="check-row"><input id="ch-enabled" type="checkbox" checked>启用该渠道</label>
+        <label class="span-2 openai-only">Base URL
+          <input id="ch-base-url" autocomplete="off" placeholder="https://api.example.com/v1">
+        </label>
+        <label class="openai-only">认证头
+          <select id="ch-auth-header">
+            <option value="bearer">bearer（Authorization: Bearer）</option>
+            <option value="x-api-key">x-api-key</option>
+          </select>
+        </label>
+        <label class="openai-only">token 上限字段
+          <select id="ch-token-field">
+            <option value="max_tokens">max_tokens</option>
+            <option value="max_completion_tokens">max_completion_tokens</option>
+          </select>
+        </label>
+        <label class="check-row span-2 openai-only"><input id="ch-stream-options" type="checkbox" checked>向上游请求 stream_options.include_usage（用量统计更准确）</label>
+        <label class="opencode-only">可执行文件
+          <input id="ch-command" autocomplete="off" placeholder="opencode">
+        </label>
+        <label class="opencode-only">工作目录
+          <input id="ch-workspace" autocomplete="off" placeholder="./workspace">
+        </label>
+        <label class="opencode-only span-2">允许的工作区根目录（每行一个绝对路径，供 x-code2api-workspace 使用）
+          <textarea id="ch-workspace-roots" rows="2" placeholder="E:\GithubProject"></textarea>
+        </label>
+        <label class="opencode-only">默认 Agent
+          <input id="ch-agent" autocomplete="off" placeholder="build">
+        </label>
+        <label class="opencode-only">审批模式
+          <select id="ch-permission-mode">
+            <option value="ask">每次询问（面板处理）</option>
+            <option value="allow">自动允许</option>
+            <option value="deny">自动拒绝</option>
+          </select>
+        </label>
+        <label class="check-row opencode-only"><input id="ch-auto-models" type="checkbox" checked>自动从 opencode 发现模型（无需手填）</label>
+        <label class="opencode-only">最大 worker 数
+          <input id="ch-max-workers" type="number" min="1" max="8" value="1">
+        </label>
+        <label class="opencode-only">每 worker 并发会话
+          <input id="ch-max-sessions" type="number" min="1" max="64" value="4">
+        </label>
+        <label class="opencode-only">空闲回收（分钟）
+          <input id="ch-idle-ttl-min" type="number" min="1" value="15">
+        </label>
+        <label class="opencode-only">内存预算 MB（0=不限）
+          <input id="ch-memory-mb" type="number" min="0" value="0">
+        </label>
+        <label class="opencode-only span-2">外部服务地址（可选，留空自动拉起）
+          <input id="ch-oc-base-url" autocomplete="off" placeholder="http://127.0.0.1:4096">
+        </label>
+      </div>
+
+      <div class="form-section openai-only">
+        <div class="section-head">
+          <h3>密钥</h3>
+          <div class="section-actions">
+            <span class="muted">保存后不回显，只显示掩码</span>
+            <button id="add-key-btn">添加密钥</button>
+          </div>
+        </div>
+        <div id="keys-editor" class="stack"></div>
+      </div>
+
+      <div class="form-section">
+        <div class="section-head">
+          <h3>模型 <span id="model-count" class="muted"></span></h3>
+          <button id="add-model-btn">添加模型</button>
+        </div>
+        <div class="model-picker-row">
+          <select id="model-picker"></select>
+          <button id="model-remove-btn" class="mini danger" type="button">移除</button>
+        </div>
+        <div id="models-editor" class="stack"></div>
+      </div>
+
+      <p id="channel-form-error" class="login-error" hidden></p>
+    </div>
+    <div class="dialog-foot">
+      <button id="channel-cancel">取消</button>
+      <button id="channel-save" class="primary">保存</button>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast" hidden></div>
+  <datalist id="effort-options">
+    <option value="minimal"></option>
+    <option value="low"></option>
+    <option value="medium"></option>
+    <option value="high"></option>
+    <option value="xhigh"></option>
+    <option value="max"></option>
+  </datalist>
+  <script src="/admin/app.js" defer></script>
+</body>
+</html>

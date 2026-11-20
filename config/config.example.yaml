@@ -1,0 +1,144 @@
+# Code2Api 本地网关配置
+# 复制本文件为 config/config.yaml 后按需修改。
+# 密钥可通过 key_env 引用环境变量，避免明文入库。
+
+server:
+  host: 127.0.0.1          # 只监听回环地址
+  port: 8787
+  body_limit_mb: 50
+  client_keys: []          # 非空时，/v1/* 需要 Bearer 或 x-api-key 匹配其中之一
+  max_concurrency: 32      # 同时在跑的生成请求上限（0=不限）
+  max_queue_wait_ms: 120000 # 并发排队超时，超时返回 503
+
+admin:
+  token: ""                # 留空则每次启动生成临时口令并打印到控制台
+
+storage:
+  path: ./data/gateway.db  # 相对路径按启动目录解析；数据永久保留，不自动删除
+
+routing:
+  max_attempts: 6          # 单个请求最多尝试的 渠道×密钥 次数
+  model_aliases:           # 对外模型别名；支持 * 通配与 $1 捕获
+    # fast: gpt-4o-mini
+    # "team/*": "gpt-4o-$1"
+  model_blacklist: []      # 黑名单，支持通配，如 "*-image*"
+  cooldowns:
+    auth_ms: 600000        # 401/403：密钥失效冷却 10 分钟
+    rate_limit_ms: 60000   # 429 基础冷却，连续失败指数递增
+    payment_ms: 1800000    # 402 余额/额度耗尽冷却 30 分钟
+    server_ms: 15000       # 5xx 冷却
+    network_ms: 10000      # 网络错误/超时冷却
+    empty_stream_ms: 5000  # 上游 200 但无首包
+    max_ms: 1800000        # 冷却上限
+
+anthropic:
+  emit_thinking: false     # Anthropic 客户端是否接收 reasoning 块（无签名，默认关闭）
+
+catalog:
+  sync_enabled: true       # 从上游 /models 同步模型目录
+  sync_on_start: true      # 启动时立即同步一次（失败不影响启动）
+  sync_interval_ms: 3600000 # 定时同步间隔（默认 1 小时）
+  reasoning_hints: true    # 按模型名推断 reasoning 能力（可被手工配置覆盖）
+
+health:
+  enabled: true            # 主动探活（HTTP 渠道探测 /models）
+  interval_ms: 300000      # 探活间隔
+  timeout_ms: 10000        # 单次探活超时
+
+providers:
+  # 内置 mock 渠道：无需密钥，用于首跑自测；正式使用可置 enabled: false
+  - id: mock
+    type: mock
+    priority: 1000
+    models:
+      - id: mock-chat
+        context_window: 32768
+        max_output_tokens: 4096
+        capabilities:
+          tools: true
+          vision: false
+          reasoning: true
+        pricing:
+          input_per_mtok: 0
+          output_per_mtok: 0
+
+  # API key 型渠道示例（去掉注释并填写）
+  # - id: station-a
+  #   type: openai-compatible
+  #   priority: 10
+  #   base_url: https://api.example.com/v1   # 建议以 /v1 结尾
+  #   auth_header: bearer                    # bearer | x-api-key
+  #   token_limit_field: max_tokens          # max_tokens | max_completion_tokens
+  #   send_stream_options: true              # 上游支持 stream_options.include_usage
+  #   sync_models: true                      # 从上游 /models 同步模型目录（默认 true）
+  #   default_reasoning_effort: medium       # reasoning 模型默认推理强度（客户端未指定时注入，支持 xhigh/max 等）
+  #   reasoning_budget_field: reasoning.max_tokens  # Anthropic thinking.budget_tokens 透传字段（点号路径）
+  #   quota:                                 # 可选：额度探针（按返回 JSON 路径解析）
+  #     enabled: true
+  #     url: https://api.example.com/quota
+  #     interval_ms: 60000
+  #     remaining_path: data.remaining_percent
+  #     reset_at_path: data.reset_at
+  #   keepalive:                             # 可选：闲置保活（会消耗少量额度）
+  #     enabled: false
+  #     interval_ms: 300000
+  #     model: gpt-4o-mini
+  #     max_tokens: 8
+  #     prompt: ping
+  #   extra_headers: {}                      # 额外请求头（非密钥）
+  #   timeouts:
+  #     connect_ms: 30000
+  #     ttfb_ms: 60000
+  #     idle_ms: 120000
+  #     total_ms: 600000
+  #   keys:
+  #     - label: main
+  #       key_env: STATION_A_KEY             # 从环境变量读取
+  #     # - label: backup
+  #     #   key: sk-xxxx                     # 或直接写明文
+  #   models:
+  #     - id: gpt-4o-mini                    # 对外模型名
+  #       upstream: gpt-4o-mini              # 上游真实模型名，缺省同 id
+  #       context_window: 128000
+  #       max_output_tokens: 16384
+  #       capabilities:
+  #         tools: true
+  #         vision: true
+  #         reasoning: false
+  #       reasoning_effort: medium          # 该模型默认推理强度（仅 reasoning=true 时生效，支持 xhigh/max 等）
+  #       pricing:
+  #         input_per_mtok: 0.15
+  #         output_per_mtok: 0.6
+  #         cache_read_per_mtok: 0.075
+
+  # CLI / 订阅型渠道示例（本机 opencode serve）
+  # - id: opencode
+  #   type: opencode
+  #   priority: 20
+  #   command: opencode                      # 可执行文件
+  #   workspace: ./workspace                 # CLI 工作目录（自动创建）
+  #   workspace_roots:                       # 允许请求头 x-code2api-workspace 指定的工作区根目录（绝对路径）
+  #     - E:/GithubProject                   # 只接受这些目录自身及其子目录，且目录必须已存在
+  #   agent: build
+  #   permission_mode: ask                   # ask | allow | deny
+  #   auto_models: true                      # 自动从 /api/model 发现模型，models 可留空
+  #   max_workers: 2                         # 本地进程池上限（外部服务模式固定 1）
+  #   max_concurrent_sessions: 4             # 每个 worker 的并发会话数
+  #   idle_ttl_ms: 900000                    # 空闲 worker 回收时间
+  #   memory_budget_mb: 2048                 # 本地 worker 总内存预算（0=不限）
+  #   question_timeout_ms: 600000            # 面板提问等待超时
+  #   task_timeout_ms: 1800000               # 单任务超时
+  #   startup_timeout_ms: 60000
+  #   restart_budget: 3
+  #   # base_url: http://127.0.0.1:4096     # 连接已有 serve 时填写；口令取自 password_env
+  #   # password_env: OPENCODE_SERVER_PASSWORD
+  #   models: []                             # auto_models 时可留空
+  #   # models:
+  #   #   - id: oc-free
+  #   #     upstream: opencode/iceman-free   # providerID/modelID
+  #   #     context_window: 262144
+  #   #     max_output_tokens: 131072
+  #   #     capabilities:
+  #   #       tools: true
+  #   #       vision: false
+  #   #       reasoning: true

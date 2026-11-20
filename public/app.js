@@ -1,0 +1,1563 @@
+'use strict';
+
+(() => {
+  const TOKEN_KEY = 'code2api.token';
+  const state = {
+    token: sessionStorage.getItem(TOKEN_KEY) || '',
+    range: '24h',
+    loading: false,
+    channels: [],
+    channelsEditable: false,
+    editingChannelId: null,
+    editingModels: [],
+    selectedModelIndex: 0,
+    models: [],
+    modelFilter: '',
+    collapsedModelGroups: new Set(),
+  };
+
+  const $ = (selector) => document.querySelector(selector);
+  const loginEl = $('#login');
+  const appEl = $('#app');
+  const tokenInput = $('#token');
+  const loginError = $('#login-error');
+  const loginBtn = $('#login-btn');
+  const providersBody = $('#providers-body');
+  const requestsBody = $('#requests-body');
+  const modelsBody = $('#models-body');
+  const modelFilter = $('#model-filter');
+  const kpisEl = $('#kpis');
+  const connStatus = $('#conn-status');
+  const serverMeta = $('#server-meta');
+  const updatedAt = $('#updated-at');
+  const toastEl = $('#toast');
+  const channelsBody = $('#channels-body');
+  const channelsNote = $('#channels-note');
+  const addChannelBtn = $('#add-channel-btn');
+  const channelDialog = $('#channel-dialog');
+  const keysEditor = $('#keys-editor');
+  const modelsEditor = $('#models-editor');
+  const modelPicker = $('#model-picker');
+  const modelCount = $('#model-count');
+  const modelRemoveBtn = $('#model-remove-btn');
+  const questionsPanel = $('#questions-panel');
+  const questionsList = $('#questions-list');
+
+  const intFmt = new Intl.NumberFormat('zh-CN');
+  const compactFmt = new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 });
+
+  function el(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  }
+
+  function td(text, className) {
+    return el('td', className, text);
+  }
+
+  function chip(text, tone) {
+    return el('span', `chip ${tone}`, text);
+  }
+
+  function fmtInt(value) {
+    return intFmt.format(Number(value) || 0);
+  }
+
+  function fmtTokens(value) {
+    const n = Number(value) || 0;
+    return n >= 10000 ? compactFmt.format(n) : intFmt.format(n);
+  }
+
+  function fmtCost(value) {
+    if (value === null || value === undefined) return '—';
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '—';
+    if (n === 0) return '$0';
+    const digits = n < 0.01 ? 6 : 4;
+    return '$' + n.toFixed(digits).replace(/0+$/, '').replace(/\.$/, '');
+  }
+
+  function fmtMs(value) {
+    if (value === null || value === undefined) return '—';
+    const ms = Number(value);
+    if (!Number.isFinite(ms)) return '—';
+    if (ms < 1000) return `${Math.round(ms)} ms`;
+    return `${(ms / 1000).toFixed(2)} s`;
+  }
+
+  function fmtTime(ts) {
+    const date = new Date(ts);
+    if (Number.isNaN(date.getTime())) return '—';
+    return date.toLocaleString('zh-CN', {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    });
+  }
+
+  function fmtDuration(seconds) {
+    const s = Math.max(0, Math.floor(Number(seconds) || 0));
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ${s % 60}s`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ${m % 60}m`;
+    return `${Math.floor(h / 24)}d ${h % 24}h`;
+  }
+
+  function fmtCooldown(ms) {
+    const s = Math.max(0, Math.ceil(Number(ms) / 1000));
+    return fmtDuration(s);
+  }
+
+  function fmtContext(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return '—';
+    if (n >= 1000) return `${Math.round(n / 1000)}k`;
+    return String(n);
+  }
+
+  function setConn(online) {
+    connStatus.textContent = online ? '在线' : '离线';
+    connStatus.className = online ? 'conn on' : 'conn off';
+  }
+
+  function showToast(message) {
+    toastEl.textContent = message;
+    toastEl.hidden = false;
+    window.clearTimeout(showToast.timer);
+    showToast.timer = window.setTimeout(() => {
+      toastEl.hidden = true;
+    }, 3200);
+  }
+
+  function setLoggedIn(loggedIn) {
+    loginEl.hidden = loggedIn;
+    appEl.hidden = !loggedIn;
+    if (!loggedIn) {
+      tokenInput.value = '';
+      setConn(false);
+      if (channelDialog.open) channelDialog.close();
+    }
+  }
+
+  class AuthError extends Error {}
+
+  async function api(path) {
+    const response = await fetch(path, {
+      headers: { authorization: `Bearer ${state.token}` },
+      cache: 'no-store',
+    });
+    if (response.status === 401) throw new AuthError('unauthorized');
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  }
+
+  function kpi(label, value, sub) {
+    const card = el('div', 'kpi');
+    card.append(el('div', 'kpi-label', label), el('div', 'kpi-value', value));
+    if (sub) card.append(el('div', 'kpi-sub', sub));
+    return card;
+  }
+
+  function renderOverview(overview) {
+    const { server, totals } = overview;
+    serverMeta.textContent = `v${server.version} · 运行 ${fmtDuration(server.uptimeSec)} · ${server.host}:${server.port} · 客户端鉴权：${server.clientAuth ? '开' : '关'}`;
+
+    kpisEl.replaceChildren(
+      kpi('请求数', fmtInt(totals.requests), `${fmtInt(totals.ok)} 成功 · ${fmtInt(totals.errors)} 失败 · ${fmtInt(totals.cancelled)} 取消`),
+      kpi('成功率', totals.successRate === null ? '—' : `${(totals.successRate * 100).toFixed(1)}%`, `${fmtInt(totals.ok)} / ${fmtInt(totals.requests)}`),
+      kpi('输入 Tokens', fmtTokens(totals.inputTokens), totals.reasoningTokens ? `推理 ${fmtInt(totals.reasoningTokens)}` : ''),
+      kpi('输出 Tokens', fmtTokens(totals.outputTokens), ''),
+      kpi('估算费用', fmtCost(totals.costUsd), '按模型单价折算'),
+      kpi('平均延迟', fmtMs(totals.avgLatencyMs), '成功请求'),
+      kpi('平均首字节', fmtMs(totals.avgTtfbMs), '流式请求'),
+    );
+
+    providersBody.replaceChildren();
+    if (!overview.providers.length) {
+      const tr = el('tr');
+      const cell = td('暂无渠道', 'empty');
+      cell.colSpan = 9;
+      tr.append(cell);
+      providersBody.append(tr);
+      return;
+    }
+
+    for (const provider of overview.providers) {
+      const tr = el('tr', provider.enabled ? '' : 'dim');
+
+      const nameCell = el('td');
+      nameCell.append(el('div', 'key-name', provider.id));
+      nameCell.append(el('div', 'muted', `${provider.models.length} 个模型 · 优先级 ${provider.priority}`));
+      tr.append(nameCell);
+
+      const runtimeTypeCell = td(
+        provider.type === 'openai-compatible' ? 'openai' : provider.type,
+      );
+      runtimeTypeCell.title = provider.type;
+      tr.append(runtimeTypeCell);
+
+      const statusCell = el('td');
+      const cooling = provider.keys.some((key) => key.status === 'cooling');
+      if (!provider.enabled) statusCell.append(chip('已禁用', 'idle'));
+      else if (provider.disabledReason) statusCell.append(chip(provider.disabledReason, 'warn'));
+      else if (cooling) statusCell.append(chip('冷却中', 'warn'));
+      else statusCell.append(chip('可用', 'good'));
+      tr.append(statusCell);
+
+      const keysCell = el('td');
+      if (!provider.keys.length) {
+        keysCell.textContent = '—';
+      } else {
+        const list = el('div', 'key-list');
+        for (const key of provider.keys) {
+          const line = el('div', 'key-line');
+          line.append(el('span', 'key-name', key.label));
+          line.append(el('span', 'key-secret', key.masked));
+          if (key.status === 'ready') line.append(chip('就绪', 'good'));
+          else if (key.status === 'cooling') {
+            line.append(chip(`冷却 ${fmtCooldown(key.cooldownRemainingMs)}`, 'warn'));
+          } else {
+            line.append(chip('缺环境变量', 'bad'));
+          }
+          line.append(
+            el('span', 'key-stats', `完成 ${key.stats.requests} · 失败 ${key.stats.errors}`),
+          );
+          list.append(line);
+        }
+        keysCell.append(list);
+      }
+      tr.append(keysCell);
+
+      tr.append(td(fmtInt(provider.stats.requests), 'num'));
+      tr.append(td(fmtInt(provider.stats.errors), 'num'));
+      tr.append(td(fmtTokens(provider.stats.inputTokens), 'num'));
+      tr.append(td(fmtTokens(provider.stats.outputTokens), 'num'));
+      tr.append(td(fmtCost(provider.stats.costUsd), 'num'));
+      providersBody.append(tr);
+    }
+  }
+
+  const STATUS_LABELS = { ok: '成功', error: '失败', cancelled: '取消' };
+  const STATUS_TONES = { ok: 'good', error: 'bad', cancelled: 'idle' };
+
+  function renderRequests(requests) {
+    requestsBody.replaceChildren();
+    if (!requests.length) {
+      const tr = el('tr');
+      const cell = td('该区间暂无请求', 'empty');
+      cell.colSpan = 9;
+      tr.append(cell);
+      requestsBody.append(tr);
+      return;
+    }
+    for (const item of requests) {
+      const tr = el('tr');
+      tr.append(td(fmtTime(item.ts)));
+
+      const endpointCell = td(item.endpoint);
+      if (item.stream) endpointCell.append(el('span', 'muted', ' · 流式'));
+      tr.append(endpointCell);
+
+      const modelCell = el('td');
+      modelCell.append(el('span', 'key-name', item.requestedModel));
+      if (item.upstreamModel && item.upstreamModel !== item.requestedModel) {
+        modelCell.append(el('span', 'muted', ` → ${item.upstreamModel}`));
+      }
+      tr.append(modelCell);
+
+      tr.append(td(`${item.provider || '—'} / ${item.keyLabel || '—'}`));
+
+      const statusCell = el('td');
+      statusCell.append(
+        chip(STATUS_LABELS[item.status] || item.status, STATUS_TONES[item.status] || 'idle'),
+      );
+      tr.append(statusCell);
+
+      const tokenCell = td(`${fmtTokens(item.inputTokens)} / ${fmtTokens(item.outputTokens)}`, 'num');
+      tokenCell.title = `输入 ${item.inputTokens} / 输出 ${item.outputTokens}${item.reasoningTokens ? ` / 推理 ${item.reasoningTokens}` : ''}${item.estimated ? '（估算）' : ''}`;
+      tr.append(tokenCell);
+
+      tr.append(td(fmtMs(item.latencyMs), 'num'));
+      tr.append(td(fmtMs(item.ttfbMs), 'num'));
+
+      const errorCell = td(item.error || '', 'err');
+      if (item.error) errorCell.title = item.error;
+      tr.append(errorCell);
+
+      requestsBody.append(tr);
+    }
+  }
+
+  function buildModelRow(model) {
+    const tr = el('tr', model.enabled ? '' : 'dim');
+    tr.append(td(model.id));
+    tr.append(td(model.provider));
+    tr.append(td(model.upstream));
+    tr.append(td(fmtContext(model.contextWindow), 'num'));
+
+    const capsCell = el('td');
+    const caps = el('div', 'caps');
+    const labels = [];
+    if (model.capabilities.tools) labels.push('工具');
+    if (model.capabilities.vision) labels.push('视觉');
+    if (model.capabilities.reasoning) labels.push('推理');
+    if (!labels.length) caps.append(el('span', 'muted', '—'));
+    else labels.forEach((label) => caps.append(el('span', 'cap', label)));
+    capsCell.append(caps);
+    tr.append(capsCell);
+
+    const pricing = model.pricing;
+    const priceText =
+      pricing && (pricing.inputPerMtok !== undefined || pricing.outputPerMtok !== undefined)
+        ? `${pricing.inputPerMtok !== undefined ? '$' + pricing.inputPerMtok : '—'} / ${pricing.outputPerMtok !== undefined ? '$' + pricing.outputPerMtok : '—'}`
+        : '—';
+    tr.append(td(priceText, 'num'));
+    return tr;
+  }
+
+  function renderModels(models) {
+    state.models = models || [];
+    modelsBody.replaceChildren();
+    const keyword = state.modelFilter;
+    const groups = [];
+    for (const model of state.models) {
+      const haystack = `${model.id} ${model.upstream} ${model.provider}`.toLowerCase();
+      if (keyword && !haystack.includes(keyword)) continue;
+      let group = groups.find((item) => item.provider === model.provider);
+      if (!group) {
+        group = { provider: model.provider, providerType: model.providerType, models: [] };
+        groups.push(group);
+      }
+      group.models.push(model);
+    }
+    if (!groups.length) {
+      const tr = el('tr');
+      const cell = td(state.models.length ? '暂无匹配模型' : '暂无模型', 'empty');
+      cell.colSpan = 6;
+      tr.append(cell);
+      modelsBody.append(tr);
+      return;
+    }
+    for (const group of groups) {
+      const collapsed = state.collapsedModelGroups.has(group.provider);
+      const headTr = el('tr', 'group-row');
+      const headCell = td('');
+      headCell.colSpan = 6;
+      const toggle = el('button', 'group-toggle');
+      toggle.type = 'button';
+      toggle.textContent = `${collapsed ? '▸' : '▾'} ${group.provider} · ${group.providerType} · ${group.models.length} 个模型`;
+      toggle.addEventListener('click', () => {
+        if (state.collapsedModelGroups.has(group.provider)) {
+          state.collapsedModelGroups.delete(group.provider);
+        } else {
+          state.collapsedModelGroups.add(group.provider);
+        }
+        renderModels(state.models);
+      });
+      headCell.append(toggle);
+      headTr.append(headCell);
+      modelsBody.append(headTr);
+      if (!collapsed) {
+        for (const model of group.models) modelsBody.append(buildModelRow(model));
+      }
+    }
+  }
+
+  function keyStatusChip(key) {
+    if (key.status === 'ready') return chip('就绪', 'good');
+    if (key.status === 'cooling') return chip(`冷却 ${fmtCooldown(key.cooldownRemainingMs)}`, 'warn');
+    return chip('缺环境变量', 'bad');
+  }
+
+  function renderChannels(data) {
+    state.channels = data.channels || [];
+    state.channelsEditable = Boolean(data.editable);
+    channelsNote.textContent = state.channelsEditable
+      ? '修改写入 config.yaml 并立即生效'
+      : '当前服务未加载配置文件路径，渠道只读';
+    addChannelBtn.disabled = !state.channelsEditable;
+
+    channelsBody.replaceChildren();
+    if (!state.channels.length) {
+      const tr = el('tr');
+      const cell = td('暂无渠道', 'empty');
+      cell.colSpan = 7;
+      tr.append(cell);
+      channelsBody.append(tr);
+      return;
+    }
+
+    for (const provider of state.channels) {
+      const tr = el('tr', provider.enabled ? '' : 'dim');
+
+      const nameCell = el('td');
+      nameCell.append(el('div', 'key-name', provider.id));
+      nameCell.append(el('div', 'muted', `优先级 ${provider.priority}`));
+      tr.append(nameCell);
+
+      const typeCell = td(provider.type === 'openai-compatible' ? 'openai' : provider.type);
+      typeCell.title = provider.type;
+      tr.append(typeCell);
+
+      const statusCell = el('td');
+      const worker = provider.opencode?.worker;
+      if (!provider.enabled) statusCell.append(chip('已禁用', 'idle'));
+      else if (provider.disabledReason) statusCell.append(chip(provider.disabledReason, 'warn'));
+      else if (provider.opencode) {
+        const state = worker?.state;
+        if (!worker || state === 'idle') statusCell.append(chip('待启动', 'idle'));
+        else if (state === 'ready') statusCell.append(chip('运行中', 'good'));
+        else if (state === 'starting') statusCell.append(chip('启动中', 'warn'));
+        else if (state === 'restarting') statusCell.append(chip('重启中', 'warn'));
+        else if (state === 'error') statusCell.append(chip('进程错误', 'bad'));
+        else statusCell.append(chip('已停止', 'idle'));
+        if (worker) {
+          statusCell.title = [
+            worker.mode === 'external' ? '外部服务' : '本地进程',
+            worker.pid ? `PID ${worker.pid}` : '',
+            worker.baseUrl ?? '',
+            worker.lastError ?? '',
+          ]
+            .filter(Boolean)
+            .join(' · ');
+        }
+      } else statusCell.append(chip('可用', 'good'));
+
+      const monitoring = provider.monitoring;
+      if (monitoring) {
+        const health = monitoring.health;
+        const healthLabel =
+          health.status === 'healthy'
+            ? '探活正常'
+            : health.status === 'unhealthy'
+              ? '探活失败'
+              : health.status === 'skipped'
+                ? '探活跳过'
+                : '探活未知';
+        const healthTone =
+          health.status === 'healthy'
+            ? 'good'
+            : health.status === 'unhealthy'
+              ? 'bad'
+              : 'idle';
+        const extras = el('div', 'muted');
+        extras.append(chip(healthLabel, healthTone));
+        if (monitoring.quota?.remainingPercent !== undefined) {
+          extras.append(
+            el(
+              'span',
+              'key-stats',
+              ` 额度 ${Math.round(monitoring.quota.remainingPercent)}%`,
+            ),
+          );
+        }
+        if (monitoring.keepalive) {
+          extras.append(
+            el(
+              'span',
+              'key-stats',
+              monitoring.keepalive.ok ? ' 保活正常' : ' 保活失败',
+            ),
+          );
+        }
+        if (provider.opencode?.pool) {
+          const pool = provider.opencode.pool;
+          extras.append(
+            el(
+              'span',
+              'key-stats',
+              ` workers ${pool.workers.length} · 会话 ${pool.activeSessions}/${pool.maxSessions}` +
+                (pool.totalRssMb ? ` · ${Math.round(pool.totalRssMb)}MB` : ''),
+            ),
+          );
+        }
+        statusCell.append(extras);
+        if (health.error) {
+          statusCell.title = health.error;
+        }
+      }
+      tr.append(statusCell);
+
+      const baseUrl =
+        provider.baseUrl ||
+        provider.opencode?.baseUrl ||
+        provider.opencode?.worker?.baseUrl ||
+        (provider.opencode ? '自动拉起' : '—');
+      const baseCell = td(baseUrl, 'cell-clip');
+      if (baseUrl) baseCell.title = baseUrl;
+      tr.append(baseCell);
+
+      const keyCell = el('td');
+      if (!provider.keys.length) keyCell.textContent = '—';
+      else {
+        const list = el('div', 'key-list');
+        for (const key of provider.keys) {
+          const line = el('div', 'key-line');
+          line.append(el('span', 'key-name', key.label));
+          line.append(el('span', 'key-secret', key.hasKey ? key.masked : '未设置'));
+          if (key.keyEnv) line.append(el('span', 'key-stats', `env: ${key.keyEnv}`));
+          line.append(keyStatusChip(key));
+          list.append(line);
+        }
+        keyCell.append(list);
+      }
+      tr.append(keyCell);
+
+      const modelCell = el('td');
+      const modelDetails = el('details', 'model-details');
+      const modelSummary = el('summary', '', `${provider.models.length} 个模型`);
+      modelSummary.title = '点击展开 / 收起模型列表';
+      modelDetails.append(modelSummary);
+      const modelList = el('div', 'key-list model-details-list');
+      for (const model of provider.models) {
+        modelList.append(el('div', 'model-line', model.id));
+      }
+      modelDetails.append(modelList);
+      modelCell.append(modelDetails);
+      tr.append(modelCell);
+
+      const actionsCell = el('td');
+      const actions = el('div', 'channel-actions');
+      const editButton = el('button', 'mini', '编辑');
+      editButton.type = 'button';
+      editButton.dataset.channelAction = 'edit';
+      editButton.dataset.channelId = provider.id;
+      editButton.disabled = !state.channelsEditable;
+      const deleteButton = el('button', 'mini danger', '删除');
+      deleteButton.type = 'button';
+      deleteButton.dataset.channelAction = 'delete';
+      deleteButton.dataset.channelId = provider.id;
+      deleteButton.disabled = !state.channelsEditable;
+      actions.append(editButton, deleteButton);
+      actionsCell.append(actions);
+      tr.append(actionsCell);
+
+      channelsBody.append(tr);
+    }
+  }
+
+  function buildQuestionField(field) {
+    const key = String(field.key ?? '');
+    const title = String(field.title ?? key);
+    const type = String(field.type ?? 'string');
+    if (type === 'boolean') {
+      const label = el('label', 'check-row');
+      label.dataset.fieldKey = key;
+      const input = el('input', 'q-value');
+      input.type = 'checkbox';
+      input.checked = Boolean(field.default);
+      label.append(input, document.createTextNode(title));
+      return label;
+    }
+
+    const label = el('label');
+    label.dataset.fieldKey = key;
+    label.append(el('span', 'question-meta', title));
+    if (field.description) label.append(el('span', 'muted', String(field.description)));
+
+    if (type === 'multiselect') {
+      const wrap = el('div', 'caps-row');
+      const defaults = Array.isArray(field.default) ? field.default : [];
+      for (const option of Array.isArray(field.options) ? field.options : []) {
+        const optionLabel = el('label');
+        const input = el('input', 'q-multi');
+        input.type = 'checkbox';
+        input.value = String(option.value);
+        input.checked = defaults.includes(option.value);
+        optionLabel.append(input, document.createTextNode(String(option.label ?? option.value)));
+        wrap.append(optionLabel);
+      }
+      label.append(wrap);
+      return label;
+    }
+
+    if (type === 'string' && Array.isArray(field.options) && field.options.length > 0) {
+      const select = el('select', 'q-value');
+      for (const option of field.options) {
+        const node = el('option', '', String(option.label ?? option.value));
+        node.value = String(option.value);
+        select.append(node);
+      }
+      if (field.default !== undefined) select.value = String(field.default);
+      label.append(select);
+      if (field.custom) {
+        const input = el('input', 'q-custom');
+        input.placeholder = '或直接输入';
+        label.append(input);
+      }
+      return label;
+    }
+
+    const input = el('input', 'q-value');
+    if (type === 'number' || type === 'integer') {
+      input.type = 'number';
+      if (type === 'integer') input.step = '1';
+      if (field.min !== undefined) input.min = String(field.min);
+      if (field.max !== undefined) input.max = String(field.max);
+    } else {
+      input.type = 'text';
+      if (field.format === 'email') input.type = 'email';
+    }
+    if (field.default !== undefined && field.default !== null) {
+      input.value = String(field.default);
+    }
+    if (field.placeholder) input.placeholder = String(field.placeholder);
+    label.append(input);
+    return label;
+  }
+
+  function collectQuestionAnswer(fields, container) {
+    const answer = {};
+    for (const label of container.querySelectorAll('label[data-field-key]')) {
+      const key = label.dataset.fieldKey;
+      const field = fields.find((item) => String(item.key) === key) || { key, type: 'string' };
+      const type = String(field.type ?? 'string');
+      let value;
+      if (type === 'boolean') {
+        value = label.querySelector('.q-value')?.checked === true;
+      } else if (type === 'multiselect') {
+        value = [...label.querySelectorAll('.q-multi:checked')].map((input) => input.value);
+      } else if (type === 'string' && Array.isArray(field.options) && field.options.length > 0) {
+        const custom = label.querySelector('.q-custom')?.value.trim();
+        value = custom || label.querySelector('.q-value')?.value || '';
+      } else {
+        const raw = label.querySelector('.q-value')?.value ?? '';
+        if (type === 'number' || type === 'integer') {
+          if (raw.trim() === '') {
+            value = undefined;
+          } else {
+            const number = Number(raw);
+            if (!Number.isFinite(number) || (type === 'integer' && !Number.isInteger(number))) {
+              throw new Error(`${field.title || key} 必须是${type === 'integer' ? '整数' : '数字'}`);
+            }
+            value = number;
+          }
+        } else {
+          value = raw;
+        }
+      }
+      if (
+        field.required &&
+        (value === undefined || value === '' || (Array.isArray(value) && value.length === 0))
+      ) {
+        throw new Error(`请填写：${field.title || key}`);
+      }
+      if (value !== undefined && value !== '') answer[key] = value;
+    }
+    return answer;
+  }
+
+  function renderQuestions(data) {
+    const questions = data?.questions || [];
+    questionsPanel.hidden = questions.length === 0;
+    questionsList.replaceChildren();
+    for (const question of questions) {
+      const card = el('div', 'question-card');
+      const head = el('div', 'question-head');
+      const info = el('div');
+      const title =
+        question.kind === 'form'
+          ? String(question.payload?.title || '需要确认')
+          : `审批：${String(question.payload?.action || '工具调用')}`;
+      info.append(el('div', 'question-title', title));
+      info.append(
+        el(
+          'div',
+          'question-meta',
+          `${question.providerId} · ${question.gatewaySessionId} · ${question.kind === 'form' ? '确认' : '审批'}`,
+        ),
+      );
+      head.append(info, chip(question.kind === 'form' ? '等待回答' : '等待审批', 'warn'));
+      card.append(head);
+
+      if (question.kind === 'permission') {
+        const resources = Array.isArray(question.payload?.resources)
+          ? question.payload.resources.join(', ')
+          : '';
+        if (resources) {
+          card.append(el('div', 'question-meta', `资源：${resources}`));
+        }
+        const actions = el('div', 'question-actions');
+        for (const [decision, label, danger] of [
+          ['once', '允许一次', false],
+          ['always', '始终允许', false],
+          ['reject', '拒绝', true],
+        ]) {
+          const button = el('button', danger ? 'mini danger' : 'mini', label);
+          button.type = 'button';
+          button.addEventListener('click', () =>
+            void answerQuestion(question.id, { decision }, button),
+          );
+          actions.append(button);
+        }
+        card.append(actions);
+      } else {
+        const fields = Array.isArray(question.payload?.fields) ? question.payload.fields : [];
+        const container = el('div', 'question-fields');
+        for (const field of fields) container.append(buildQuestionField(field));
+        card.append(container);
+        const actions = el('div', 'question-actions');
+        const submit = el('button', 'primary mini', '提交回答');
+        submit.type = 'button';
+        submit.addEventListener('click', () => {
+          try {
+            const answer = collectQuestionAnswer(fields, container);
+            void answerQuestion(question.id, { answer }, submit);
+          } catch (error) {
+            showToast(error.message);
+          }
+        });
+        actions.append(submit);
+        card.append(actions);
+      }
+      questionsList.append(card);
+    }
+  }
+
+  async function answerQuestion(id, payload, button) {
+    if (button) button.disabled = true;
+    try {
+      const response = await fetch(
+        `/admin/api/questions/${encodeURIComponent(id)}/answer`,
+        {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${state.token}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        },
+      );
+      const body = await response.json().catch(() => ({}));
+      if (response.status === 401) {
+        setLoggedIn(false);
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(body?.error?.message || `提交失败（HTTP ${response.status}）`);
+      }
+      showToast('回答已提交，任务继续执行');
+      await refresh();
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  function labeled(text, control, className) {
+    const label = el('label', className);
+    label.append(document.createTextNode(text), control);
+    return label;
+  }
+
+  function readOptionalInteger(value, name, min) {
+    const trimmed = String(value).trim();
+    if (!trimmed) return undefined;
+    const n = Number(trimmed);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n < min) {
+      throw new Error(`${name} 必须是 >= ${min} 的整数`);
+    }
+    return n;
+  }
+
+  function readOptionalNumber(value, name, min) {
+    const trimmed = String(value).trim();
+    if (!trimmed) return undefined;
+    const n = Number(trimmed);
+    if (!Number.isFinite(n) || n < min) {
+      throw new Error(`${name} 必须是 >= ${min} 的数字`);
+    }
+    return n;
+  }
+
+  function addExistingKeyRow(key) {
+    const row = el('div', 'editor-row key-editor-row');
+    row.dataset.mode = 'existing';
+    row.dataset.label = key.label;
+    row.append(el('span', 'row-title', key.label));
+
+    const sub = el('div', 'row-sub');
+    sub.append(el('span', 'key-secret', key.hasKey ? key.masked : '未设置'));
+    if (key.keyEnv) sub.append(el('span', 'key-stats', `env: ${key.keyEnv}`));
+    sub.append(keyStatusChip(key));
+    row.append(sub);
+
+    const action = el('select', 'key-action-select');
+    for (const [value, text] of [
+      ['keep', '保留密钥'],
+      ['set_env', '改用环境变量'],
+      ['set_key', '更换密钥'],
+      ['remove', '删除密钥'],
+    ]) {
+      const option = el('option', '', text);
+      option.value = value;
+      action.append(option);
+    }
+    action.value = 'keep';
+    row.append(action);
+
+    const field = el('div', 'row-field');
+    const renderField = () => {
+      field.replaceChildren();
+      if (action.value === 'set_env') {
+        const input = el('input', 'env-input');
+        input.placeholder = '环境变量名，例如 STATION_A_KEY';
+        input.autocomplete = 'off';
+        if (key.keyEnv) input.value = key.keyEnv;
+        field.append(input);
+      } else if (action.value === 'set_key') {
+        const input = el('input', 'key-input');
+        input.type = 'password';
+        input.autocomplete = 'off';
+        input.placeholder = '新的密钥值';
+        field.append(input);
+      }
+    };
+    action.addEventListener('change', renderField);
+    renderField();
+    row.append(field);
+
+    keysEditor.append(row);
+  }
+
+  function addNewKeyRow() {
+    const row = el('div', 'editor-row key-editor-row');
+    row.dataset.mode = 'new';
+
+    const label = el('input', 'key-label-input');
+    label.placeholder = 'label（如 main）';
+    label.autocomplete = 'off';
+    row.append(label);
+
+    const mode = el('select', 'key-mode');
+    for (const [value, text] of [
+      ['env', '环境变量'],
+      ['key', '直接填写密钥'],
+    ]) {
+      const option = el('option', '', text);
+      option.value = value;
+      mode.append(option);
+    }
+    row.append(mode);
+
+    const field = el('div', 'row-field');
+    const renderField = () => {
+      field.replaceChildren();
+      if (mode.value === 'env') {
+        const input = el('input', 'env-input');
+        input.placeholder = '环境变量名，例如 STATION_A_KEY';
+        input.autocomplete = 'off';
+        field.append(input);
+      } else {
+        const input = el('input', 'key-input');
+        input.type = 'password';
+        input.autocomplete = 'off';
+        input.placeholder = '密钥值（会明文写入本机 config.yaml）';
+        field.append(input);
+      }
+    };
+    mode.addEventListener('change', renderField);
+    renderField();
+    row.append(field);
+
+    const remove = el('button', 'mini danger model-remove', '移除');
+    remove.type = 'button';
+    remove.addEventListener('click', () => row.remove());
+    row.append(remove);
+
+    keysEditor.append(row);
+  }
+
+  function emptyModel() {
+    return {
+      id: '',
+      upstream: undefined,
+      contextWindow: undefined,
+      maxOutputTokens: undefined,
+      capabilities: { tools: true, vision: false, reasoning: false },
+      pricing: undefined,
+      reasoningEffort: undefined,
+      source: 'config',
+    };
+  }
+
+  function normalizeModel(model) {
+    return {
+      id: model?.id ?? '',
+      upstream:
+        model?.upstream && model.upstream !== model.id ? model.upstream : undefined,
+      contextWindow: model?.contextWindow ?? undefined,
+      maxOutputTokens: model?.maxOutputTokens ?? undefined,
+      capabilities: {
+        tools: model?.capabilities?.tools !== false,
+        vision: Boolean(model?.capabilities?.vision),
+        reasoning: Boolean(model?.capabilities?.reasoning),
+      },
+      pricing: model?.pricing ?? undefined,
+      reasoningEffort: model?.reasoningEffort ?? undefined,
+      source: model?.source ?? 'config',
+    };
+  }
+
+  function buildModelCard(model) {
+    const card = el('div', 'editor-row model-editor-row');
+    const head = el('div', 'model-head');
+    head.append(el('span', 'row-title', model.id || '新模型'));
+    if (model.source === 'upstream') head.append(el('span', 'muted', '上游同步'));
+    card.append(head);
+
+    const idInput = el('input', 'm-id');
+    idInput.placeholder = '对外模型名，例如 gpt-4o-mini';
+    idInput.value = model.id ?? '';
+    idInput.autocomplete = 'off';
+    idInput.addEventListener('input', () => {
+      const current = state.editingModels[state.selectedModelIndex];
+      const typed = idInput.value.trim();
+      if (current) current.id = typed || current.id;
+      const title = idInput.closest('.model-editor-row')?.querySelector('.model-head .row-title');
+      if (title) title.textContent = typed || '新模型';
+      refreshSelectedOptionText();
+    });
+    const upstreamInput = el('input', 'm-upstream');
+    upstreamInput.placeholder = '上游名；opencode 填 providerID/modelID';
+    upstreamInput.value = model.upstream ?? '';
+    upstreamInput.autocomplete = 'off';
+    upstreamInput.addEventListener('input', () => {
+      const current = state.editingModels[state.selectedModelIndex];
+      if (current) current.upstream = upstreamInput.value.trim() || undefined;
+      refreshSelectedOptionText();
+    });
+
+    const contextInput = el('input', 'm-context');
+    contextInput.type = 'number';
+    contextInput.min = '1';
+    contextInput.placeholder = '如 128000';
+    contextInput.value = model.contextWindow ? String(model.contextWindow) : '';
+
+    const outputInput = el('input', 'm-output');
+    outputInput.type = 'number';
+    outputInput.min = '1';
+    outputInput.placeholder = '如 16384';
+    outputInput.value = model.maxOutputTokens ? String(model.maxOutputTokens) : '';
+
+    const priceIn = el('input', 'm-price-in');
+    priceIn.type = 'number';
+    priceIn.min = '0';
+    priceIn.step = '0.001';
+    priceIn.placeholder = '如 0.15';
+    priceIn.value =
+      model.pricing?.inputPerMtok !== undefined ? String(model.pricing.inputPerMtok) : '';
+
+    const priceOut = el('input', 'm-price-out');
+    priceOut.type = 'number';
+    priceOut.min = '0';
+    priceOut.step = '0.001';
+    priceOut.placeholder = '如 0.6';
+    priceOut.value =
+      model.pricing?.outputPerMtok !== undefined ? String(model.pricing.outputPerMtok) : '';
+
+    const effortInput = el('input', 'm-effort');
+    effortInput.setAttribute('list', 'effort-options');
+    effortInput.placeholder = '默认（low/medium/high/xhigh/max…）';
+    effortInput.value = model.reasoningEffort ?? '';
+    effortInput.autocomplete = 'off';
+
+    const grid = el('div', 'model-grid');
+    grid.append(
+      labeled('模型 ID', idInput),
+      labeled('上游模型名', upstreamInput),
+      labeled('上下文窗口', contextInput),
+      labeled('最大输出 tokens', outputInput),
+      labeled('输入价格 / Mtok ($)', priceIn),
+      labeled('输出价格 / Mtok ($)', priceOut),
+      labeled('推理强度', effortInput),
+    );
+    card.append(grid);
+
+    const caps = el('div', 'caps-row');
+    const makeCheck = (className, text, checked) => {
+      const input = el('input', className);
+      input.type = 'checkbox';
+      input.checked = checked;
+      const label = el('label');
+      label.append(input, document.createTextNode(text));
+      return label;
+    };
+    caps.append(
+      makeCheck('m-tools', '工具调用', model.capabilities.tools),
+      makeCheck('m-vision', '视觉', model.capabilities.vision),
+      makeCheck('m-reasoning', '推理', model.capabilities.reasoning),
+    );
+    card.append(caps);
+
+    return card;
+  }
+
+  function readPositiveInteger(value) {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? Math.trunc(n) : undefined;
+  }
+
+  function readNonNegativeNumber(value) {
+    const n = Number(value);
+    return Number.isFinite(n) && n >= 0 ? n : undefined;
+  }
+
+  function syncFormToSelectedModel() {
+    const card = modelsEditor.querySelector('.model-editor-row');
+    const model = state.editingModels[state.selectedModelIndex];
+    if (!card || !model) return;
+    model.id = card.querySelector('.m-id').value.trim() || model.id;
+    model.upstream = card.querySelector('.m-upstream').value.trim() || undefined;
+    model.contextWindow = readPositiveInteger(card.querySelector('.m-context').value);
+    model.maxOutputTokens = readPositiveInteger(card.querySelector('.m-output').value);
+    const inputPerMtok = readNonNegativeNumber(card.querySelector('.m-price-in').value);
+    const outputPerMtok = readNonNegativeNumber(card.querySelector('.m-price-out').value);
+    model.pricing =
+      inputPerMtok !== undefined || outputPerMtok !== undefined
+        ? { inputPerMtok, outputPerMtok }
+        : undefined;
+    model.capabilities = {
+      tools: card.querySelector('.m-tools').checked,
+      vision: card.querySelector('.m-vision').checked,
+      reasoning: card.querySelector('.m-reasoning').checked,
+    };
+    const effort = card.querySelector('.m-effort')?.value.trim();
+    model.reasoningEffort = effort || undefined;
+  }
+
+  function refreshSelectedOptionText() {
+    const model = state.editingModels[state.selectedModelIndex];
+    const option = modelPicker.querySelector(`option[value="${state.selectedModelIndex}"]`);
+    if (!model || !option) return;
+    option.textContent =
+      model.id + (model.upstream && model.upstream !== model.id ? ` → ${model.upstream}` : '');
+  }
+
+  function renderModelPicker() {
+    modelPicker.replaceChildren();
+    const groups = [
+      ['手工配置', state.editingModels.filter((model) => model.source !== 'upstream')],
+      ['上游同步', state.editingModels.filter((model) => model.source === 'upstream')],
+    ];
+    for (const [label, list] of groups) {
+      if (!list.length) continue;
+      const group = el('optgroup');
+      group.label = `${label}（${list.length}）`;
+      for (const model of list) {
+        const option = el('option');
+        option.value = String(state.editingModels.indexOf(model));
+        option.textContent =
+          model.id + (model.upstream && model.upstream !== model.id ? ` → ${model.upstream}` : '');
+        group.append(option);
+      }
+      modelPicker.append(group);
+    }
+    modelPicker.value = String(state.selectedModelIndex);
+    modelCount.textContent = `${state.editingModels.length} 个`;
+    modelRemoveBtn.disabled = state.editingModels.length <= 1;
+  }
+
+  function renderModelForm() {
+    modelsEditor.replaceChildren();
+    const model = state.editingModels[state.selectedModelIndex];
+    if (model) modelsEditor.append(buildModelCard(model));
+  }
+
+  function updateChannelTypeVisibility() {
+    const type = $('#ch-type').value;
+    const isOpenAI = type === 'openai-compatible';
+    const isOpenCode = type === 'opencode';
+    for (const node of document.querySelectorAll('#channel-dialog .openai-only')) {
+      node.hidden = !isOpenAI;
+    }
+    for (const node of document.querySelectorAll('#channel-dialog .opencode-only')) {
+      node.hidden = !isOpenCode;
+    }
+  }
+
+  function openChannelDialog(channel) {
+    state.editingChannelId = channel ? channel.id : null;
+    $('#channel-dialog-title').textContent = channel ? `编辑渠道 · ${channel.id}` : '新增渠道';
+    $('#channel-form-error').hidden = true;
+
+    const idInput = $('#ch-id');
+    idInput.value = channel?.id ?? '';
+    idInput.disabled = Boolean(channel);
+
+    const typeSelect = $('#ch-type');
+    typeSelect.value = channel?.type ?? 'openai-compatible';
+    typeSelect.disabled = Boolean(channel);
+
+    $('#ch-priority').value = String(channel?.priority ?? 100);
+    $('#ch-enabled').checked = channel ? channel.enabled : true;
+    $('#ch-base-url').value = channel?.baseUrl ?? '';
+    $('#ch-auth-header').value = channel?.authHeader ?? 'bearer';
+    $('#ch-token-field').value = channel?.tokenLimitField ?? 'max_tokens';
+    $('#ch-stream-options').checked = channel ? channel.sendStreamOptions !== false : true;
+    $('#ch-command').value = channel?.opencode?.command ?? 'opencode';
+    $('#ch-workspace').value = channel?.opencode?.workspace ?? './workspace';
+    $('#ch-workspace-roots').value = (channel?.opencode?.workspaceRoots ?? []).join('\n');
+    $('#ch-agent').value = channel?.opencode?.agent ?? 'build';
+    $('#ch-permission-mode').value = channel?.opencode?.permissionMode ?? 'ask';
+    $('#ch-auto-models').checked = channel?.opencode?.autoModels !== false;
+    $('#ch-max-workers').value = String(channel?.opencode?.maxWorkers ?? 1);
+    $('#ch-max-sessions').value = String(
+      channel?.opencode?.maxConcurrentSessions ?? 4,
+    );
+    $('#ch-idle-ttl-min').value = String(
+      Math.round((channel?.opencode?.idleTtlMs ?? 900000) / 60000),
+    );
+    $('#ch-memory-mb').value = String(channel?.opencode?.memoryBudgetMb ?? 0);
+    $('#ch-oc-base-url').value = channel?.opencode?.baseUrl ?? '';
+
+    keysEditor.replaceChildren();
+    if (channel) {
+      for (const key of channel.keys) addExistingKeyRow(key);
+    } else {
+      addNewKeyRow();
+    }
+
+    state.editingModels = channel
+      ? channel.models.map(normalizeModel)
+      : [emptyModel()];
+    state.selectedModelIndex = 0;
+    renderModelPicker();
+    renderModelForm();
+
+    updateChannelTypeVisibility();
+    channelDialog.showModal();
+    if (!channel) idInput.focus();
+  }
+
+  function collectKeys() {
+    const rows = Array.from(keysEditor.querySelectorAll('.key-editor-row'));
+    const labels = new Set();
+    return rows.map((row) => {
+      const existing = row.dataset.mode === 'existing';
+      const label = existing
+        ? row.dataset.label
+        : row.querySelector('.key-label-input').value.trim();
+      if (!label) throw new Error('新密钥需要填写 label');
+      if (labels.has(label)) throw new Error(`密钥 label 重复：${label}`);
+      labels.add(label);
+
+      if (existing) {
+        const action = row.querySelector('.key-action-select').value;
+        if (action === 'keep' || action === 'remove') return { action, label };
+        if (action === 'set_env') {
+          const keyEnv = row.querySelector('.env-input')?.value.trim();
+          if (!keyEnv) throw new Error(`密钥 ${label} 请填写环境变量名`);
+          return { action, label, keyEnv };
+        }
+        const key = row.querySelector('.key-input')?.value.trim();
+        if (!key) throw new Error(`密钥 ${label} 请填写新密钥`);
+        return { action: 'set_key', label, key };
+      }
+
+      const mode = row.querySelector('.key-mode').value;
+      if (mode === 'env') {
+        const keyEnv = row.querySelector('.env-input')?.value.trim();
+        if (!keyEnv) throw new Error(`密钥 ${label} 请填写环境变量名`);
+        return { action: 'new', label, mode: 'env', keyEnv };
+      }
+      const key = row.querySelector('.key-input')?.value.trim();
+      if (!key) throw new Error(`密钥 ${label} 请填写密钥值`);
+      return { action: 'new', label, mode: 'key', key };
+    });
+  }
+
+  function collectModels(allowEmpty = false) {
+    syncFormToSelectedModel();
+    const models = state.editingModels.slice();
+    if (!models.length) {
+      if (allowEmpty) return [];
+      throw new Error('至少添加一个模型');
+    }
+    const seen = new Set();
+    return models.map((model) => {
+      const id = String(model.id ?? '').trim();
+      if (!id) throw new Error('模型 ID 不能为空');
+      if (seen.has(id)) throw new Error(`模型 ID 重复：${id}`);
+      seen.add(id);
+      const upstream = String(model.upstream ?? '').trim();
+      const contextWindow = model.contextWindow;
+      if (
+        contextWindow !== undefined &&
+        !(Number.isInteger(contextWindow) && contextWindow > 0)
+      ) {
+        throw new Error(`模型 ${id} 的上下文窗口必须为正整数`);
+      }
+      const maxOutputTokens = model.maxOutputTokens;
+      if (
+        maxOutputTokens !== undefined &&
+        !(Number.isInteger(maxOutputTokens) && maxOutputTokens > 0)
+      ) {
+        throw new Error(`模型 ${id} 的最大输出必须为正整数`);
+      }
+      const pricing = model.pricing;
+      if (pricing) {
+        for (const [name, value] of [
+          ['输入', pricing.inputPerMtok],
+          ['输出', pricing.outputPerMtok],
+        ]) {
+          if (value !== undefined && !(Number.isFinite(value) && value >= 0)) {
+            throw new Error(`模型 ${id} 的${name}价格必须为非负数`);
+          }
+        }
+      }
+      return {
+        id,
+        upstream: upstream || undefined,
+        contextWindow,
+        maxOutputTokens,
+        capabilities: {
+          tools: Boolean(model.capabilities?.tools),
+          vision: Boolean(model.capabilities?.vision),
+          reasoning: Boolean(model.capabilities?.reasoning),
+        },
+        pricing:
+          pricing &&
+          (pricing.inputPerMtok !== undefined || pricing.outputPerMtok !== undefined)
+            ? { inputPerMtok: pricing.inputPerMtok, outputPerMtok: pricing.outputPerMtok }
+            : undefined,
+        reasoningEffort: model.reasoningEffort,
+      };
+    });
+  }
+
+  function buildChannelPayload() {
+    const id = $('#ch-id').value.trim();
+    if (!id) throw new Error('请填写渠道 ID');
+    const type = $('#ch-type').value;
+    const priority = readOptionalInteger($('#ch-priority').value, '优先级', -1000000);
+    const autoModels = type === 'opencode' && $('#ch-auto-models').checked;
+    const models = collectModels(autoModels);
+    const payload = {
+      id,
+      type,
+      priority: priority ?? 100,
+      enabled: $('#ch-enabled').checked,
+      models,
+      keys: [],
+    };
+    if (type === 'openai-compatible') {
+      const baseUrl = $('#ch-base-url').value.trim();
+      if (!baseUrl) throw new Error('请填写 Base URL');
+      payload.baseUrl = baseUrl;
+      payload.authHeader = $('#ch-auth-header').value;
+      payload.tokenLimitField = $('#ch-token-field').value;
+      payload.sendStreamOptions = $('#ch-stream-options').checked;
+      payload.keys = collectKeys();
+    } else if (type === 'opencode') {
+      payload.command = $('#ch-command').value.trim() || undefined;
+      payload.workspace = $('#ch-workspace').value.trim() || undefined;
+      payload.workspaceRoots = $('#ch-workspace-roots')
+        .value.split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter(Boolean);
+      payload.agent = $('#ch-agent').value.trim() || undefined;
+      payload.permissionMode = $('#ch-permission-mode').value;
+      payload.autoModels = $('#ch-auto-models').checked;
+      const maxWorkers = readOptionalInteger($('#ch-max-workers').value, '最大 worker 数', 1);
+      const maxSessions = readOptionalInteger(
+        $('#ch-max-sessions').value,
+        '每 worker 并发会话',
+        1,
+      );
+      const idleMinutes = readOptionalInteger(
+        $('#ch-idle-ttl-min').value,
+        '空闲回收分钟',
+        1,
+      );
+      const memoryMb = readOptionalInteger($('#ch-memory-mb').value, '内存预算 MB', 0);
+      payload.maxWorkers = maxWorkers;
+      payload.maxConcurrentSessions = maxSessions;
+      payload.idleTtlMs = idleMinutes !== undefined ? idleMinutes * 60000 : undefined;
+      payload.memoryBudgetMb = memoryMb;
+      const baseUrl = $('#ch-oc-base-url').value.trim();
+      if (baseUrl) payload.baseUrl = baseUrl;
+      payload.keys = [];
+    }
+    return payload;
+  }
+
+  async function saveChannel() {
+    const errorEl = $('#channel-form-error');
+    const saveButton = $('#channel-save');
+    errorEl.hidden = true;
+    saveButton.disabled = true;
+    try {
+      const payload = buildChannelPayload();
+      const editing = Boolean(state.editingChannelId);
+      const response = await fetch(
+        editing
+          ? `/admin/api/channels/${encodeURIComponent(state.editingChannelId)}`
+          : '/admin/api/channels',
+        {
+          method: editing ? 'PUT' : 'POST',
+          headers: {
+            authorization: `Bearer ${state.token}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        },
+      );
+      const body = await response.json().catch(() => ({}));
+      if (response.status === 401) {
+        setLoggedIn(false);
+        throw new Error('登录已失效，请重新登录');
+      }
+      if (!response.ok) {
+        throw new Error(body?.error?.message || `保存失败（HTTP ${response.status}）`);
+      }
+      channelDialog.close();
+      const warnings = Array.isArray(body.warnings) ? body.warnings : [];
+      showToast([editing ? '渠道已更新' : '渠道已创建', ...warnings].join('；'));
+      await refresh();
+    } catch (error) {
+      errorEl.textContent = error.message;
+      errorEl.hidden = false;
+    } finally {
+      saveButton.disabled = false;
+    }
+  }
+
+  async function deleteChannelById(id) {
+    if (!window.confirm(`删除渠道 ${id}？该操作会写入配置文件。`)) return;
+    try {
+      const response = await fetch(`/admin/api/channels/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+        headers: { authorization: `Bearer ${state.token}` },
+      });
+      const body = await response.json().catch(() => ({}));
+      if (response.status === 401) {
+        setLoggedIn(false);
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(body?.error?.message || `删除失败（HTTP ${response.status}）`);
+      }
+      showToast(`渠道 ${id} 已删除`);
+      await refresh();
+    } catch (error) {
+      showToast(error.message);
+    }
+  }
+
+  async function runMaintenance(path, successText) {
+    try {
+      const response = await fetch(path, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${state.token}` },
+      });
+      const body = await response.json().catch(() => ({}));
+      if (response.status === 401) {
+        setLoggedIn(false);
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(body?.error?.message || `操作失败（HTTP ${response.status}）`);
+      }
+      showToast(successText);
+      await refresh();
+    } catch (error) {
+      showToast(error.message);
+    }
+  }
+
+  async function exportData() {
+    try {
+      const response = await fetch('/admin/api/export', {
+        headers: { authorization: `Bearer ${state.token}` },
+      });
+      if (response.status === 401) {
+        setLoggedIn(false);
+        return;
+      }
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body?.error?.message || `导出失败（HTTP ${response.status}）`);
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `code2api-backup-${new Date().toISOString().slice(0, 10)}.db`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      showToast('数据库备份已导出');
+    } catch (error) {
+      showToast(error.message);
+    }
+  }
+
+  async function refresh() {
+    if (!state.token || state.loading) return;
+    state.loading = true;
+    const range = state.range;
+    try {
+      const [overview, requests, models, channelData, questionData] = await Promise.all([
+        api(`/admin/api/overview?range=${encodeURIComponent(range)}`),
+        api(`/admin/api/requests?range=${encodeURIComponent(range)}&limit=100`),
+        api('/admin/api/models'),
+        api('/admin/api/channels'),
+        api('/admin/api/questions'),
+      ]);
+      renderOverview(overview);
+      renderRequests(requests.requests || []);
+      renderModels(models.models || []);
+      renderChannels(channelData);
+      renderQuestions(questionData);
+      setConn(true);
+      setLoggedIn(true);
+      loginError.hidden = true;
+      updatedAt.textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
+    } catch (error) {
+      if (error instanceof AuthError) {
+        state.token = '';
+        sessionStorage.removeItem(TOKEN_KEY);
+        setLoggedIn(false);
+        loginError.textContent = '口令无效或已更换，请重新输入。';
+        loginError.hidden = false;
+      } else {
+        setConn(false);
+        showToast(`刷新失败：${error.message}`);
+      }
+    } finally {
+      state.loading = false;
+    }
+  }
+
+  async function login() {
+    const value = tokenInput.value.trim();
+    if (!value) {
+      loginError.textContent = '请输入管理口令。';
+      loginError.hidden = false;
+      return;
+    }
+    loginBtn.disabled = true;
+    loginBtn.textContent = '连接中…';
+    try {
+      const response = await fetch(`/admin/api/overview?range=${encodeURIComponent(state.range)}`, {
+        headers: { authorization: `Bearer ${value}` },
+        cache: 'no-store',
+      });
+      if (response.status === 401) {
+        loginError.textContent = '口令不正确，请检查启动日志或 config.yaml。';
+        loginError.hidden = false;
+        return;
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      state.token = value;
+      sessionStorage.setItem(TOKEN_KEY, value);
+      loginError.hidden = true;
+      setLoggedIn(true);
+      await refresh();
+    } catch (error) {
+      loginError.textContent = error instanceof AuthError ? '口令不正确。' : '无法连接网关，请确认服务已启动。';
+      loginError.hidden = false;
+    } finally {
+      loginBtn.disabled = false;
+      loginBtn.textContent = '连接';
+    }
+  }
+
+  loginBtn.addEventListener('click', login);
+  tokenInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') login();
+  });
+
+  addChannelBtn.addEventListener('click', () => openChannelDialog(null));
+  $('#probe-btn').addEventListener('click', () =>
+    void runMaintenance('/admin/api/maintenance/probe', '探活完成'),
+  );
+  $('#keepalive-btn').addEventListener('click', () =>
+    void runMaintenance('/admin/api/maintenance/keepalive', '保活已触发'),
+  );
+  $('#export-btn').addEventListener('click', () => void exportData());
+  $('#channel-close').addEventListener('click', () => channelDialog.close());
+  $('#channel-cancel').addEventListener('click', () => channelDialog.close());
+  $('#channel-save').addEventListener('click', () => void saveChannel());
+  $('#add-key-btn').addEventListener('click', () => addNewKeyRow());
+  $('#add-model-btn').addEventListener('click', () => {
+    syncFormToSelectedModel();
+    state.editingModels.push(emptyModel());
+    state.selectedModelIndex = state.editingModels.length - 1;
+    renderModelPicker();
+    renderModelForm();
+  });
+  modelPicker.addEventListener('change', () => {
+    syncFormToSelectedModel();
+    state.selectedModelIndex = Number(modelPicker.value);
+    renderModelForm();
+  });
+  modelFilter.addEventListener('input', () => {
+    state.modelFilter = modelFilter.value.trim().toLowerCase();
+    renderModels(state.models);
+  });
+  modelRemoveBtn.addEventListener('click', () => {
+    syncFormToSelectedModel();
+    state.editingModels.splice(state.selectedModelIndex, 1);
+    state.selectedModelIndex = Math.max(
+      0,
+      Math.min(state.selectedModelIndex, state.editingModels.length - 1),
+    );
+    renderModelPicker();
+    renderModelForm();
+  });
+  $('#ch-type').addEventListener('change', updateChannelTypeVisibility);
+
+  channelsBody.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-channel-action]');
+    if (!button) return;
+    const id = button.dataset.channelId;
+    const action = button.dataset.channelAction;
+    if (!id) return;
+    if (action === 'edit') {
+      const channel = state.channels.find((item) => item.id === id);
+      if (channel) openChannelDialog(channel);
+    } else if (action === 'delete') {
+      void deleteChannelById(id);
+    }
+  });
+
+  $('#logout-btn').addEventListener('click', () => {
+    state.token = '';
+    sessionStorage.removeItem(TOKEN_KEY);
+    setLoggedIn(false);
+  });
+
+  $('#refresh-btn').addEventListener('click', () => {
+    void refresh();
+  });
+
+  $('#range').addEventListener('change', (event) => {
+    state.range = event.target.value;
+    void refresh();
+  });
+
+  window.setInterval(() => {
+    if (!document.hidden) void refresh();
+  }, 5000);
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) void refresh();
+  });
+
+  if (state.token) {
+    setLoggedIn(true);
+    void refresh();
+  } else {
+    setLoggedIn(false);
+    tokenInput.focus();
+  }
+})();
