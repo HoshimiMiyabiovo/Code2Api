@@ -106,6 +106,12 @@ export interface CanonicalResponse {
   toolCalls: CanonicalToolCall[];
   stopReason: StopReason;
   usage: Usage;
+  /**
+   * 上游真实消耗（桥接任务内部多 step 的累加），只用于记账/面板/计费；
+   * usage 字段对客户端保持 OpenAI 语义（≈本次请求的 prompt 规模），
+   * 否则客户端的上下文仪表会被内部 agent 循环的累加值撑爆。
+   */
+  upstreamUsage?: Usage;
 }
 
 export type StreamEvent =
@@ -118,7 +124,13 @@ export type StreamEvent =
       name?: string;
       argumentsDelta?: string;
     }
-  | { type: 'usage'; usage: Usage }
+  | {
+      type: 'usage';
+      usage: Usage;
+      /** 桥接任务的累加消耗（多 step），只进数据库记账；缺省时与 usage 相同。 */
+      upstreamUsage?: Usage;
+    }
+  | { type: 'keepalive' }
   | { type: 'finish'; reason: StopReason };
 
 export function textOf(parts: ContentPart[]): string {

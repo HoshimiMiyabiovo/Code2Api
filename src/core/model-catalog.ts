@@ -188,14 +188,23 @@ export class ModelCatalog {
           let providerAdded = 0;
           let providerUpdated = 0;
           for (const info of infos) {
+            const detected = info.capabilities ?? {};
+            let reasoning = detected.reasoning;
+            if (reasoning === undefined) {
+              // 上游未声明时：默认放行（由上游报错后自动降级）；
+              // strict_capabilities=true 时恢复严格（按名字推断或判为不支持）。
+              reasoning = config.strictCapabilities
+                ? config.reasoningHints && guessReasoningModel(info.id)
+                : true;
+            }
             const model: ModelConfig = {
               id: info.id,
               upstream: info.id,
               contextWindow: info.contextWindow,
               capabilities: {
-                tools: true,
-                vision: false,
-                reasoning: config.reasoningHints ? guessReasoningModel(info.id) : false,
+                tools: detected.tools ?? true,
+                vision: detected.vision ?? false,
+                reasoning,
               },
               source: 'upstream',
             };

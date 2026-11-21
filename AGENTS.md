@@ -6,7 +6,7 @@
 
 - 任何时候都不要为了“验证一下”去调用真实上游或消耗真实渠道额度；真实请求可能导致账号被封。
 - 默认验证方式只有：
-  - `npm test`（`test/` 下的 fake opencode server / mock 渠道）
+  - `npm test`（`test/` 下的 fake opencode / zcode server / mock 渠道）
   - 本地面板与 admin API 的只读检查
   - 前端 DOM / 布局检查
 - 新增协议、路由或修复必须补 fake 测试，不要拿真实模型复现问题。
@@ -39,8 +39,13 @@
 
 - opencode `/api/model` 中缺 `type`、`name === modelID`、`cost` 为空的条目是配置残影，必须过滤（实际请求会返回 `Model is unavailable`）。
 - 请求头 `x-code2api-workspace` 只接受 `workspace_roots` 白名单内已存在的绝对路径；会话首次创建时绑定工作区，已绑定会话换目录返回 400（opencode 的 `move` 会发 idle 事件）。
+- codearts 风味桥接 CodeArts IDE 内核（旧版 opencode API，路由无 `/api` 前缀）：`/event` 可能是 `{type, properties}`，也可能套 `{directory, payload:{type, properties}}` 信封；sessionID 可能嵌在 `data/properties/info/part/message/session`。归一化在 `src/providers/opencode-worker.ts`，改协议先补 `test/codearts.test.ts` 的 fake 回归。排障时设 `CODE2API_LOG_LEVEL=debug`，前 N 帧（`event_debug_frames`，已脱敏）与丢弃原因会直接打印；首包预算/静默心跳用 `first_byte_timeout_ms` / `stream_heartbeat_ms`（面板可改）。
 - 模型同步只进内存、不回写 YAML；手工 `models` 优先；上下文窗口从 `limit.context` / `limit.output` 发现并回填。
 - 历史数据永久保留；面板的时间范围只是查询窗口。
+- zcode 渠道桥接 ZCode CLI 的 `app-server`（stdio NDJSON「ZCode Protocol」，v0.17.1 实测）：无自动模型发现，`models` 必填且 upstream 为 `providerId/modelId`；CLI 凭据复用桌面端共享登录态（`~/.zcode/v2/credentials.json`），未登录时只能报错引导；`session/create` 参数为 strict zod，CLI 升级可能破坏字段契约，真实 `providerId` 取值需冒烟校准（fake 测试不消耗 zai 额度）。
+- zcode 协议反向请求的应答同样受 strict zod 校验（v0.17.1 实测）：`session/requestRuntimePreferences` 必须答 `{nativeSearchEnhancementsEnabled: boolean}`，未知键（如 `presentationSurface`）会 ZodError 导致会话无法物化；CLI 升级后先用 fake server 的严格握手回归。
+- 独立 CLI 的 Provider Registry 与桌面端内嵌实例不共享凭据：桌面端注入自己的凭据库，独立 CLI 只读共享 `~/.zcode/v2/credentials.json`，缺账号 identity 凭据时所有 `account:*` provider 均 `entitled:false`、注册表为空，任何 upstream 都过不了 `session/create` 校验。需 CLI 自身完成一次 `zcode login`（浏览器授权，写入共享登录态）后账号 provider 才注册。
+- qoder 渠道桥接 Qoder CLI 的 daemon（`--sdk`，stdio NDJSON，`daemon_protocol_version: 2`；从 IDE 0.5.17 内嵌 `qoder-worker-runtime.obf.mjs` 反编译确认）：无自动模型发现，`models` 必填且 upstream 为 `providerId/modelId`（真实取值待冒烟校准）；默认拉起路径是 IDE 同款 `Qoder.exe + ELECTRON_RUN_AS_NODE=1 + <app.asar.unpacked>/@qoder-ai/qoder-agent-sdk/dist/_worker/qoder-worker-runtime.obf.mjs --sdk`，IDE 升级会换 `.qoder-versions` 目录，配置路径要跟着改。凭据是未校准点：IDE 用 jobToken（依赖 IDE 宿主反向 RPC，网关无法复现），能否直接复用 IDE 登录态未知，兜底是 env 注入 `QODER_PERSONAL_ACCESS_TOKEN`（CN 版前缀 `QODERCN_`）；`can_use_tool` 反向请求应答 `{behavior:'allow'|'deny'}`，未知反向请求一律回 error 防悬挂。CLI 升级后先用 `test/fake-qoder-server.cjs` 的握手回归（不消耗额度）。
 
 ## 5. 入口与命令
 

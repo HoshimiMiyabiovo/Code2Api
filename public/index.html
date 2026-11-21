@@ -50,6 +50,40 @@
     <main>
       <section class="kpis" id="kpis" aria-label="总览指标"></section>
 
+      <section class="panel" id="retry-panel">
+        <div class="panel-head">
+          <h2>重试与限流回避</h2>
+          <span class="muted">429 / 5xx / 超时 / 空流时在请求内等待并重试，保存后立即生效</span>
+          <div class="panel-actions">
+            <span id="retry-note" class="muted"></span>
+            <button id="retry-save" class="primary">保存重试设置</button>
+          </div>
+        </div>
+        <div class="form-grid" id="retry-form">
+          <label class="check-row"><input id="retry-enabled" type="checkbox">启用自动重试</label>
+          <label class="check-row"><input id="retry-respect" type="checkbox">优先使用上游 Retry-After</label>
+          <label>最大重试次数
+            <input id="retry-max" type="number" min="0" max="20" step="1">
+          </label>
+          <label>初始退避（毫秒）
+            <input id="retry-initial" type="number" min="0" max="3600000" step="100">
+          </label>
+          <label>最大退避（毫秒）
+            <input id="retry-max-delay" type="number" min="0" max="3600000" step="100">
+          </label>
+          <label>退避抖动比例（0–1）
+            <input id="retry-jitter" type="number" min="0" max="1" step="0.05">
+          </label>
+          <label>单请求总等待上限（毫秒）
+            <input id="retry-total" type="number" min="0" max="3600000" step="1000">
+          </label>
+          <div class="span-2">
+            <div class="muted">重试类别</div>
+            <div id="retry-categories" class="check-row"></div>
+          </div>
+        </div>
+      </section>
+
       <section class="panel" id="questions-panel" hidden>
         <div class="panel-head">
           <h2>待处理提问</h2>
@@ -179,6 +213,8 @@
           <select id="ch-type">
             <option value="openai-compatible">openai-compatible</option>
             <option value="opencode">opencode（CLI 任务级）</option>
+            <option value="zcode">zcode（ZCode CLI 任务级）</option>
+            <option value="qoder">qoder（Qoder CLI 任务级）</option>
             <option value="mock">mock</option>
           </select>
         </label>
@@ -202,14 +238,24 @@
           </select>
         </label>
         <label class="check-row span-2 openai-only"><input id="ch-stream-options" type="checkbox" checked>向上游请求 stream_options.include_usage（用量统计更准确）</label>
-        <label class="opencode-only">可执行文件
-          <input id="ch-command" autocomplete="off" placeholder="opencode">
+        <label class="cli-only">可执行文件
+          <input id="ch-command" autocomplete="off" placeholder="node 或 opencode">
         </label>
-        <label class="opencode-only">工作目录
+        <label class="cli-only">工作目录
           <input id="ch-workspace" autocomplete="off" placeholder="./workspace">
         </label>
-        <label class="opencode-only span-2">允许的工作区根目录（每行一个绝对路径，供 x-code2api-workspace 使用）
+        <label class="cli-only span-2">允许的工作区根目录（每行一个绝对路径，供 x-code2api-workspace 使用）
           <textarea id="ch-workspace-roots" rows="2" placeholder="E:\GithubProject"></textarea>
+        </label>
+        <label class="opencode-only">上游风味
+          <select id="ch-flavor">
+            <option value="opencode">opencode 原版</option>
+            <option value="kilo">kilo（KiloDesktop 内置 CLI）</option>
+            <option value="codearts">codearts（CodeArts Agent IDE 内核）</option>
+          </select>
+        </label>
+        <label class="opencode-only span-2">CodeArts 数据目录（可选，留空用默认 ~/.codeartsdoer/codearts-data；仅 codearts 风味生效）
+          <input id="ch-codearts-data-dir" autocomplete="off" placeholder="C:\Users\<用户名>\.codeartsdoer\codearts-data">
         </label>
         <label class="opencode-only">默认 Agent
           <input id="ch-agent" autocomplete="off" placeholder="build">
@@ -222,20 +268,63 @@
           </select>
         </label>
         <label class="check-row opencode-only"><input id="ch-auto-models" type="checkbox" checked>自动从 opencode 发现模型（无需手填）</label>
-        <label class="opencode-only">最大 worker 数
+        <label class="opencode-only span-2">发现过滤（每行一个 glob，留空=全部；例如 *:free 只接免费模型；手工模型不受影响）
+          <textarea id="ch-model-filter" rows="2" placeholder="*:free"></textarea>
+        </label>
+        <label class="cli-only">最大 worker 数
           <input id="ch-max-workers" type="number" min="1" max="8" value="1">
         </label>
-        <label class="opencode-only">每 worker 并发会话
+        <label class="cli-only">每 worker 并发会话
           <input id="ch-max-sessions" type="number" min="1" max="64" value="4">
         </label>
-        <label class="opencode-only">空闲回收（分钟）
+        <label class="cli-only">空闲回收（分钟）
           <input id="ch-idle-ttl-min" type="number" min="1" value="15">
+        </label>
+        <label class="opencode-only">首包超时（秒，0=关闭；超时即明确报错）
+          <input id="ch-first-byte-sec" type="number" min="0" value="120">
+        </label>
+        <label class="opencode-only">静默 SSE 心跳（秒，0=关闭）
+          <input id="ch-stream-heartbeat-sec" type="number" min="0" value="10">
+        </label>
+        <label class="opencode-only">/event 调试帧数（0=关闭；日志级别需 debug）
+          <input id="ch-event-debug-frames" type="number" min="0" value="20">
         </label>
         <label class="opencode-only">内存预算 MB（0=不限）
           <input id="ch-memory-mb" type="number" min="0" value="0">
         </label>
         <label class="opencode-only span-2">外部服务地址（可选，留空自动拉起）
           <input id="ch-oc-base-url" autocomplete="off" placeholder="http://127.0.0.1:4096">
+        </label>
+        <label class="zcode-only span-2">CLI 启动参数（每行一个；不含 app-server，网关会自动追加）
+          <textarea id="ch-args" rows="2" placeholder="F:\Program Files\zcode\resources\glm\zcode.cjs"></textarea>
+        </label>
+        <label class="zcode-only span-2">CLI 环境变量（每行 KEY=VALUE；注入 CLI 子进程）
+          <textarea id="ch-zcode-env" rows="3" placeholder="ZCODE_DATA_BASE_DIR=E:\GithubProject\Code2Api\data\zcode-cli"></textarea>
+        </label>
+        <label class="zcode-only">会话权限模式
+          <select id="ch-mode">
+            <option value="plan">plan（只读规划）</option>
+            <option value="build">build（常规，工具需审批）</option>
+            <option value="edit">edit（放宽编辑）</option>
+            <option value="yolo">yolo（全部自动放行）</option>
+            <option value="guarded">guarded（保守模式）</option>
+          </select>
+        </label>
+        <label class="qoder-only span-2">CLI 启动参数（每行一个；不含 --sdk，网关会自动追加。IDE 内嵌 runtime 用 Qoder.exe + qoder-worker-runtime.mjs）
+          <textarea id="ch-qoder-args" rows="2" placeholder="E:\Program Files\Qoder\.qoder-versions\0.5.17\resources\app.asar.unpacked\node_modules\@qoder-ai\qoder-agent-sdk\dist\_worker\qoder-worker-runtime.obf.mjs"></textarea>
+        </label>
+        <label class="qoder-only span-2">CLI 环境变量（每行 KEY=VALUE；注入 CLI 子进程）
+          <textarea id="ch-qoder-env" rows="3" placeholder="ELECTRON_RUN_AS_NODE=1"></textarea>
+        </label>
+        <label class="qoder-only">会话权限模式
+          <select id="ch-qoder-mode">
+            <option value="auto">auto（IDE 同款自动审批）</option>
+            <option value="default">default（工具需面板审批）</option>
+            <option value="accept_edits">accept_edits（放宽编辑）</option>
+            <option value="dont_ask">dont_ask（少询问）</option>
+            <option value="plan">plan（只读规划）</option>
+            <option value="bypass_permissions">bypass_permissions（全部自动放行）</option>
+          </select>
         </label>
       </div>
 

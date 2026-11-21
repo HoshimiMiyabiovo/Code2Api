@@ -14,6 +14,8 @@
     models: [],
     modelFilter: '',
     collapsedModelGroups: new Set(),
+    retryDirty: false,
+    retryEditable: false,
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -42,6 +44,16 @@
   const modelRemoveBtn = $('#model-remove-btn');
   const questionsPanel = $('#questions-panel');
   const questionsList = $('#questions-list');
+  const retryNote = $('#retry-note');
+  const retrySaveBtn = $('#retry-save');
+  const retryEnabled = $('#retry-enabled');
+  const retryRespect = $('#retry-respect');
+  const retryMax = $('#retry-max');
+  const retryInitial = $('#retry-initial');
+  const retryMaxDelay = $('#retry-max-delay');
+  const retryJitter = $('#retry-jitter');
+  const retryTotal = $('#retry-total');
+  const retryCategoriesEl = $('#retry-categories');
 
   const intFmt = new Intl.NumberFormat('zh-CN');
   const compactFmt = new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 });
@@ -169,11 +181,22 @@
     const { server, totals } = overview;
     serverMeta.textContent = `v${server.version} · 运行 ${fmtDuration(server.uptimeSec)} · ${server.host}:${server.port} · 客户端鉴权：${server.clientAuth ? '开' : '关'}`;
 
+    // 计费视角三桶：未缓存输入（贵）/ 缓存读取（便宜）/ 输出+推理（生成侧）。
+    // 旧版网关没有拆分字段时回退为近似值。
+    const cacheRead = totals.cacheReadTokens ?? 0;
+    const cacheWrite = totals.cacheWriteTokens ?? 0;
+    const uncachedInput =
+      totals.uncachedInputTokens ?? Math.max(0, (totals.inputTokens ?? 0) - cacheRead);
+    const generated =
+      totals.generatedTokens ?? ((totals.outputTokens ?? 0) + (totals.reasoningTokens ?? 0));
+    const inputTotal = uncachedInput + cacheRead;
+    const cacheShare = inputTotal > 0 ? Math.round((cacheRead / inputTotal) * 100) : null;
     kpisEl.replaceChildren(
       kpi('请求数', fmtInt(totals.requests), `${fmtInt(totals.ok)} 成功 · ${fmtInt(totals.errors)} 失败 · ${fmtInt(totals.cancelled)} 取消`),
       kpi('成功率', totals.successRate === null ? '—' : `${(totals.successRate * 100).toFixed(1)}%`, `${fmtInt(totals.ok)} / ${fmtInt(totals.requests)}`),
-      kpi('输入 Tokens', fmtTokens(totals.inputTokens), totals.reasoningTokens ? `推理 ${fmtInt(totals.reasoningTokens)}` : ''),
-      kpi('输出 Tokens', fmtTokens(totals.outputTokens), ''),
+      kpi('未缓存输入', fmtTokens(uncachedInput), cacheWrite > 0 ? `另有缓存写入 ${fmtInt(cacheWrite)}` : '上游重放中未命中缓存的部分'),
+      kpi('缓存读取', fmtTokens(cacheRead), cacheShare === null ? '' : `占输入 ${cacheShare}%`),
+      kpi('输出 + 推理', fmtTokens(generated), totals.reasoningTokens ? `其中推理 ${fmtInt(totals.reasoningTokens)}` : '生成侧合计'),
       kpi('估算费用', fmtCost(totals.costUsd), '按模型单价折算'),
       kpi('平均延迟', fmtMs(totals.avgLatencyMs), '成功请求'),
       kpi('平均首字节', fmtMs(totals.avgTtfbMs), '流式请求'),
@@ -407,10 +430,11 @@
       tr.append(typeCell);
 
       const statusCell = el('td');
-      const worker = provider.opencode?.worker;
+      const bridgeInfo = provider.opencode ?? provider.zcode ?? provider.qoder ?? null;
+      const worker = bridgeInfo?.worker;
       if (!provider.enabled) statusCell.append(chip('已禁用', 'idle'));
       else if (provider.disabledReason) statusCell.append(chip(provider.disabledReason, 'warn'));
-      else if (provider.opencode) {
+      else if (bridgeInfo) {
         const state = worker?.state;
         if (!worker || state === 'idle') statusCell.append(chip('待启动', 'idle'));
         else if (state === 'ready') statusCell.append(chip('运行中', 'good'));
@@ -419,11 +443,13 @@
         else if (state === 'error') statusCell.append(chip('进程错误', 'bad'));
         else statusCell.append(chip('已停止', 'idle'));
         if (worker) {
+          const logTail = Array.isArray(worker.logTail) ? worker.logTail.slice(-5) : [];
           statusCell.title = [
             worker.mode === 'external' ? '外部服务' : '本地进程',
             worker.pid ? `PID ${worker.pid}` : '',
-            worker.baseUrl ?? '',
+            worker.baseUrl ?? worker.workspace ?? '',
             worker.lastError ?? '',
+            logTail.length ? `stderr: ${logTail.join(' | ').slice(0, 300)}` : '',
           ]
             .filter(Boolean)
             .join(' · ');
@@ -467,8 +493,8 @@
             ),
           );
         }
-        if (provider.opencode?.pool) {
-          const pool = provider.opencode.pool;
+        if (bridgeInfo?.pool) {
+          const pool = bridgeInfo.pool;
           extras.append(
             el(
               'span',
@@ -489,7 +515,9 @@
         provider.baseUrl ||
         provider.opencode?.baseUrl ||
         provider.opencode?.worker?.baseUrl ||
-        (provider.opencode ? '自动拉起' : '—');
+        (provider.opencode ? '自动拉起' : '') ||
+        (provider.zcode ? provider.zcode.command : '') ||
+        '—';
       const baseCell = td(baseUrl, 'cell-clip');
       if (baseUrl) baseCell.title = baseUrl;
       tr.append(baseCell);
@@ -939,13 +967,15 @@
     const contextInput = el('input', 'm-context');
     contextInput.type = 'number';
     contextInput.min = '1';
-    contextInput.placeholder = '如 128000';
+    contextInput.placeholder = '留空=自动取上游目录最大值';
+    contextInput.title = '留空时自动采用上游目录声明的上下文窗口（多次同步取最大值）；填写后以手工值为准';
     contextInput.value = model.contextWindow ? String(model.contextWindow) : '';
 
     const outputInput = el('input', 'm-output');
     outputInput.type = 'number';
     outputInput.min = '1';
-    outputInput.placeholder = '如 16384';
+    outputInput.placeholder = '留空=自动取上游目录最大值';
+    outputInput.title = '留空时自动采用上游目录声明的最大输出（多次同步取最大值）；填写后以手工值为准';
     outputInput.value = model.maxOutputTokens ? String(model.maxOutputTokens) : '';
 
     const priceIn = el('input', 'm-price-in');
@@ -1076,11 +1106,22 @@
     const type = $('#ch-type').value;
     const isOpenAI = type === 'openai-compatible';
     const isOpenCode = type === 'opencode';
+    const isZcode = type === 'zcode';
+    const isQoder = type === 'qoder';
     for (const node of document.querySelectorAll('#channel-dialog .openai-only')) {
       node.hidden = !isOpenAI;
     }
     for (const node of document.querySelectorAll('#channel-dialog .opencode-only')) {
       node.hidden = !isOpenCode;
+    }
+    for (const node of document.querySelectorAll('#channel-dialog .zcode-only')) {
+      node.hidden = !isZcode;
+    }
+    for (const node of document.querySelectorAll('#channel-dialog .qoder-only')) {
+      node.hidden = !isQoder;
+    }
+    for (const node of document.querySelectorAll('#channel-dialog .cli-only')) {
+      node.hidden = !(isOpenCode || isZcode || isQoder);
     }
   }
 
@@ -1103,21 +1144,40 @@
     $('#ch-auth-header').value = channel?.authHeader ?? 'bearer';
     $('#ch-token-field').value = channel?.tokenLimitField ?? 'max_tokens';
     $('#ch-stream-options').checked = channel ? channel.sendStreamOptions !== false : true;
-    $('#ch-command').value = channel?.opencode?.command ?? 'opencode';
-    $('#ch-workspace').value = channel?.opencode?.workspace ?? './workspace';
-    $('#ch-workspace-roots').value = (channel?.opencode?.workspaceRoots ?? []).join('\n');
+    const bridge = channel?.opencode ?? channel?.zcode ?? channel?.qoder ?? null;
+    $('#ch-command').value =
+      bridge?.command ??
+      (channel?.type === 'zcode' ? 'node' : channel?.type === 'qoder' ? 'qodercli' : 'opencode');
+    $('#ch-workspace').value = bridge?.workspace ?? './workspace';
+    $('#ch-workspace-roots').value = (bridge?.workspaceRoots ?? []).join('\n');
+    $('#ch-flavor').value = channel?.opencode?.flavor ?? 'opencode';
+    $('#ch-codearts-data-dir').value = channel?.opencode?.codeartsDataDir ?? '';
+    $('#ch-model-filter').value = (channel?.opencode?.modelFilter ?? []).join('\n');
     $('#ch-agent').value = channel?.opencode?.agent ?? 'build';
     $('#ch-permission-mode').value = channel?.opencode?.permissionMode ?? 'ask';
     $('#ch-auto-models').checked = channel?.opencode?.autoModels !== false;
-    $('#ch-max-workers').value = String(channel?.opencode?.maxWorkers ?? 1);
-    $('#ch-max-sessions').value = String(
-      channel?.opencode?.maxConcurrentSessions ?? 4,
+    $('#ch-max-workers').value = String(bridge?.maxWorkers ?? 1);
+    $('#ch-max-sessions').value = String(bridge?.maxConcurrentSessions ?? 4);
+    $('#ch-idle-ttl-min').value = String(Math.round((bridge?.idleTtlMs ?? 900000) / 60000));
+    $('#ch-first-byte-sec').value = String(
+      Math.round((channel?.opencode?.firstByteTimeoutMs ?? 120000) / 1000),
     );
-    $('#ch-idle-ttl-min').value = String(
-      Math.round((channel?.opencode?.idleTtlMs ?? 900000) / 60000),
+    $('#ch-stream-heartbeat-sec').value = String(
+      Math.round((channel?.opencode?.streamHeartbeatMs ?? 10000) / 1000),
     );
+    $('#ch-event-debug-frames').value = String(channel?.opencode?.eventDebugFrames ?? 20);
     $('#ch-memory-mb').value = String(channel?.opencode?.memoryBudgetMb ?? 0);
     $('#ch-oc-base-url').value = channel?.opencode?.baseUrl ?? '';
+    $('#ch-args').value = (channel?.zcode?.args ?? []).join('\n');
+    $('#ch-zcode-env').value = Object.entries(channel?.zcode?.env ?? {})
+      .map(([key, value]) => `${key}=${value}`)
+      .join('\n');
+    $('#ch-mode').value = channel?.zcode?.mode ?? 'build';
+    $('#ch-qoder-args').value = (channel?.qoder?.args ?? []).join('\n');
+    $('#ch-qoder-env').value = Object.entries(channel?.qoder?.env ?? {})
+      .map(([key, value]) => `${key}=${value}`)
+      .join('\n');
+    $('#ch-qoder-mode').value = channel?.qoder?.mode ?? 'auto';
 
     keysEditor.replaceChildren();
     if (channel) {
@@ -1258,6 +1318,13 @@
       payload.sendStreamOptions = $('#ch-stream-options').checked;
       payload.keys = collectKeys();
     } else if (type === 'opencode') {
+      payload.flavor = $('#ch-flavor').value;
+      const codeartsDataDir = $('#ch-codearts-data-dir').value.trim();
+      if (codeartsDataDir) payload.codeartsDataDir = codeartsDataDir;
+      payload.modelFilter = $('#ch-model-filter')
+        .value.split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter(Boolean);
       payload.command = $('#ch-command').value.trim() || undefined;
       payload.workspace = $('#ch-workspace').value.trim() || undefined;
       payload.workspaceRoots = $('#ch-workspace-roots')
@@ -1279,12 +1346,104 @@
         1,
       );
       const memoryMb = readOptionalInteger($('#ch-memory-mb').value, '内存预算 MB', 0);
+      const firstByteSeconds = readOptionalInteger(
+        $('#ch-first-byte-sec').value,
+        '首包超时秒',
+        0,
+      );
+      const heartbeatSeconds = readOptionalInteger(
+        $('#ch-stream-heartbeat-sec').value,
+        '静默 SSE 心跳秒',
+        0,
+      );
+      const eventDebugFrames = readOptionalInteger(
+        $('#ch-event-debug-frames').value,
+        '/event 调试帧数',
+        0,
+      );
       payload.maxWorkers = maxWorkers;
       payload.maxConcurrentSessions = maxSessions;
       payload.idleTtlMs = idleMinutes !== undefined ? idleMinutes * 60000 : undefined;
       payload.memoryBudgetMb = memoryMb;
+      payload.firstByteTimeoutMs =
+        firstByteSeconds !== undefined ? firstByteSeconds * 1000 : undefined;
+      payload.streamHeartbeatMs =
+        heartbeatSeconds !== undefined ? heartbeatSeconds * 1000 : undefined;
+      payload.eventDebugFrames = eventDebugFrames;
       const baseUrl = $('#ch-oc-base-url').value.trim();
       if (baseUrl) payload.baseUrl = baseUrl;
+      payload.keys = [];
+    } else if (type === 'zcode') {
+      payload.command = $('#ch-command').value.trim() || undefined;
+      payload.args = $('#ch-args')
+        .value.split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter(Boolean);
+      const zcodeEnv = {};
+      for (const line of $('#ch-zcode-env').value.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const eq = trimmed.indexOf('=');
+        if (eq <= 0) throw new Error(`CLI 环境变量行格式错误（应为 KEY=VALUE）：${trimmed}`);
+        zcodeEnv[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
+      }
+      payload.env = zcodeEnv;
+      payload.workspace = $('#ch-workspace').value.trim() || undefined;
+      payload.workspaceRoots = $('#ch-workspace-roots')
+        .value.split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter(Boolean);
+      payload.mode = $('#ch-mode').value;
+      const maxWorkers = readOptionalInteger($('#ch-max-workers').value, '最大 worker 数', 1);
+      const maxSessions = readOptionalInteger(
+        $('#ch-max-sessions').value,
+        '每 worker 并发会话',
+        1,
+      );
+      const idleMinutes = readOptionalInteger(
+        $('#ch-idle-ttl-min').value,
+        '空闲回收分钟',
+        1,
+      );
+      payload.maxWorkers = maxWorkers;
+      payload.maxConcurrentSessions = maxSessions;
+      payload.idleTtlMs = idleMinutes !== undefined ? idleMinutes * 60000 : undefined;
+      payload.keys = [];
+    } else if (type === 'qoder') {
+      payload.command = $('#ch-command').value.trim() || undefined;
+      payload.args = $('#ch-qoder-args')
+        .value.split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter(Boolean);
+      const qoderEnv = {};
+      for (const line of $('#ch-qoder-env').value.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const eq = trimmed.indexOf('=');
+        if (eq <= 0) throw new Error(`CLI 环境变量行格式错误（应为 KEY=VALUE）：${trimmed}`);
+        qoderEnv[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
+      }
+      payload.env = qoderEnv;
+      payload.workspace = $('#ch-workspace').value.trim() || undefined;
+      payload.workspaceRoots = $('#ch-workspace-roots')
+        .value.split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter(Boolean);
+      payload.mode = $('#ch-qoder-mode').value;
+      const maxWorkers = readOptionalInteger($('#ch-max-workers').value, '最大 worker 数', 1);
+      const maxSessions = readOptionalInteger(
+        $('#ch-max-sessions').value,
+        '每 worker 并发会话',
+        1,
+      );
+      const idleMinutes = readOptionalInteger(
+        $('#ch-idle-ttl-min').value,
+        '空闲回收分钟',
+        1,
+      );
+      payload.maxWorkers = maxWorkers;
+      payload.maxConcurrentSessions = maxSessions;
+      payload.idleTtlMs = idleMinutes !== undefined ? idleMinutes * 60000 : undefined;
       payload.keys = [];
     }
     return payload;
@@ -1400,23 +1559,141 @@
     }
   }
 
+  const RETRY_CATEGORY_OPTIONS = [
+    ['rate_limit', '限流 429'],
+    ['server', '服务端 5xx'],
+    ['timeout', '超时'],
+    ['network', '网络错误'],
+    ['empty_stream', '空首包'],
+  ];
+
+  function renderRetry(data) {
+    state.retryEditable = data.editable !== false;
+    retryNote.textContent = state.retryEditable ? '' : '当前配置只读';
+    retrySaveBtn.disabled = !state.retryEditable;
+    if (state.retryDirty) return;
+    const retry = data.retry || {};
+    retryEnabled.checked = retry.enabled !== false;
+    retryRespect.checked = retry.respectRetryAfter !== false;
+    retryMax.value = String(retry.maxRetries ?? 5);
+    retryInitial.value = String(retry.initialDelayMs ?? 500);
+    retryMaxDelay.value = String(retry.maxDelayMs ?? 10000);
+    retryJitter.value = String(retry.jitterRatio ?? 0.1);
+    retryTotal.value = String(retry.maxTotalWaitMs ?? 120000);
+    const selected = new Set(
+      Array.isArray(retry.retryOn)
+        ? retry.retryOn
+        : RETRY_CATEGORY_OPTIONS.map(([value]) => value),
+    );
+    retryCategoriesEl.replaceChildren();
+    for (const [value, label] of RETRY_CATEGORY_OPTIONS) {
+      const option = el('label', 'check-row');
+      const input = el('input');
+      input.type = 'checkbox';
+      input.value = value;
+      input.checked = selected.has(value);
+      option.append(input, document.createTextNode(label));
+      retryCategoriesEl.append(option);
+    }
+  }
+
+  function markRetryDirty() {
+    state.retryDirty = true;
+    retryNote.textContent = '有未保存的修改';
+  }
+
+  function retryInt(value, name, min, max) {
+    const n = Number(String(value).trim());
+    if (!Number.isInteger(n) || n < min || n > max) {
+      throw new Error(`${name} 必须是 ${min}–${max} 的整数`);
+    }
+    return n;
+  }
+
+  async function saveRetry() {
+    try {
+      const enabled = retryEnabled.checked;
+      const retryOn = [...retryCategoriesEl.querySelectorAll('input[type="checkbox"]:checked')]
+        .map((input) => input.value);
+      if (enabled && retryOn.length === 0) {
+        throw new Error('启用自动重试时至少选择一个重试类别');
+      }
+      const initialDelayMs = retryInt(retryInitial.value, '初始退避', 1, 3600000);
+      const maxDelayMs = retryInt(retryMaxDelay.value, '最大退避', 1, 3600000);
+      if (maxDelayMs < initialDelayMs) {
+        throw new Error('最大退避不能小于初始退避');
+      }
+      const jitterRatio = Number(retryJitter.value);
+      if (!Number.isFinite(jitterRatio) || jitterRatio < 0 || jitterRatio > 1) {
+        throw new Error('抖动比例必须在 0–1 之间');
+      }
+      const payload = {
+        enabled,
+        maxRetries: retryInt(retryMax.value, '最大重试次数', 0, 20),
+        initialDelayMs,
+        maxDelayMs,
+        jitterRatio,
+        retryOn,
+        respectRetryAfter: retryRespect.checked,
+        maxTotalWaitMs: retryInt(retryTotal.value, '总等待上限', 1, 3600000),
+      };
+      retrySaveBtn.disabled = true;
+      const response = await fetch('/admin/api/retry', {
+        method: 'PUT',
+        headers: {
+          authorization: `Bearer ${state.token}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (response.status === 401) {
+        setLoggedIn(false);
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(body?.error?.message || `保存失败（HTTP ${response.status}）`);
+      }
+      state.retryDirty = false;
+      showToast('重试设置已保存并热加载');
+      await refresh();
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      retrySaveBtn.disabled = !state.retryEditable;
+    }
+  }
+
   async function refresh() {
     if (!state.token || state.loading) return;
     state.loading = true;
     const range = state.range;
     try {
-      const [overview, requests, models, channelData, questionData] = await Promise.all([
-        api(`/admin/api/overview?range=${encodeURIComponent(range)}`),
-        api(`/admin/api/requests?range=${encodeURIComponent(range)}&limit=100`),
-        api('/admin/api/models'),
-        api('/admin/api/channels'),
-        api('/admin/api/questions'),
-      ]);
+      const retryRequest = api('/admin/api/retry').catch((error) => {
+        if (error instanceof AuthError) throw error;
+        return null;
+      });
+      const [overview, requests, models, channelData, questionData, retryData] =
+        await Promise.all([
+          api(`/admin/api/overview?range=${encodeURIComponent(range)}`),
+          api(`/admin/api/requests?range=${encodeURIComponent(range)}&limit=100`),
+          api('/admin/api/models'),
+          api('/admin/api/channels'),
+          api('/admin/api/questions'),
+          retryRequest,
+        ]);
       renderOverview(overview);
       renderRequests(requests.requests || []);
       renderModels(models.models || []);
       renderChannels(channelData);
       renderQuestions(questionData);
+      if (retryData) {
+        renderRetry(retryData);
+      } else {
+        state.retryEditable = false;
+        retrySaveBtn.disabled = true;
+        retryNote.textContent = '当前运行版本不支持重试设置，重启网关后可用';
+      }
       setConn(true);
       setLoggedIn(true);
       loginError.hidden = true;
@@ -1475,6 +1752,21 @@
   tokenInput.addEventListener('keydown', (event) => {
     if (event.key === 'Enter') login();
   });
+
+  for (const node of [
+    retryEnabled,
+    retryRespect,
+    retryMax,
+    retryInitial,
+    retryMaxDelay,
+    retryJitter,
+    retryTotal,
+  ]) {
+    node.addEventListener('input', markRetryDirty);
+    node.addEventListener('change', markRetryDirty);
+  }
+  retryCategoriesEl.addEventListener('change', markRetryDirty);
+  retrySaveBtn.addEventListener('click', () => void saveRetry());
 
   addChannelBtn.addEventListener('click', () => openChannelDialog(null));
   $('#probe-btn').addEventListener('click', () =>

@@ -342,6 +342,9 @@ export class OpenAIStreamEncoder {
 
   encode(event: StreamEvent): string[] {
     switch (event.type) {
+      case 'keepalive':
+        // SSE 注释帧：客户端收到字节（连接与空闲计时器不中断）但语义上忽略。
+        return [': keepalive\n\n'];
       case 'text_delta':
         return [this.chunk({ content: event.text }, null)];
       case 'thinking_delta':

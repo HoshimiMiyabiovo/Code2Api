@@ -33,6 +33,8 @@ export interface ModelConfig {
   pricing?: ModelPricing;
   /** 该模型对外默认注入的推理强度（仅对 reasoning 模型生效）。 */
   reasoningEffort?: ReasoningEffort;
+  /** opencode 渠道：reasoning effort 到会话 variant 的映射（自动发现时填充）。 */
+  reasoningVariants?: Record<string, string>;
   /** 模型来源：手工配置 or 上游目录同步。 */
   source?: 'config' | 'upstream';
 }
@@ -108,8 +110,16 @@ export interface OpenAIProviderConfig extends ProviderBase {
 
 export interface OpenCodeProviderConfig extends ProviderBase {
   type: 'opencode';
+  /** 上游风味：opencode 原版；kilo = KiloDesktop 内置 CLI；codearts = CodeArts Agent IDE 内核（旧版 opencode API，外部模式自动发现）。 */
+  flavor: 'opencode' | 'kilo' | 'codearts';
+  /** codearts 风味：IDE 内核数据目录（默认 ~/.codeartsdoer/codearts-data），用于发现端口与解密服务口令。 */
+  codeartsDataDir?: string;
+  /** 自动发现的模型 id 白名单（glob，如 *:free）；空数组 = 不过滤。手工 models 不受影响。 */
+  modelFilter: string[];
   command: string;
   args: string[];
+  /** spawn 时附加的环境变量（如 CodeArts 内核用 OPENCODE_DATA_DIR 隔离数据目录）。 */
+  env: Record<string, string>;
   workspace: string;
   workspaceRoots: string[];
   hostname: string;
@@ -126,11 +136,60 @@ export interface OpenCodeProviderConfig extends ProviderBase {
   memoryBudgetMb: number;
   questionTimeoutMs: number;
   taskTimeoutMs: number;
+  /** 首包（首个上游事件）等待预算；超时即中断并明确报错，避免静默黑洞。0 = 关闭。 */
+  firstByteTimeoutMs: number;
+  /** 首包等待/上游静默期间的 SSE 心跳间隔（注释帧），防止客户端空闲超时。0 = 关闭。 */
+  streamHeartbeatMs: number;
+  /** /event 原始帧 debug 日志条数（每个事件流连接），0 = 关闭；日志会脱敏并截断。 */
+  eventDebugFrames: number;
   startupTimeoutMs: number;
   restartBudget: number;
 }
 
-export type ProviderConfig = MockProviderConfig | OpenAIProviderConfig | OpenCodeProviderConfig;
+export interface ZcodeProviderConfig extends ProviderBase {
+  type: 'zcode';
+  command: string;
+  args: string[];
+  /** 追加到 CLI 子进程的环境变量（如 ZCODE_DATA_BASE_DIR / ZCODE_CREDENTIAL_SECRET_FILE）。 */
+  env: Record<string, string>;
+  workspace: string;
+  workspaceRoots: string[];
+  /** 传给 zcode 会话的权限模式（zcode: plan/build/edit/yolo/guarded）。 */
+  mode: 'plan' | 'build' | 'edit' | 'yolo' | 'guarded';
+  maxWorkers: number;
+  maxConcurrentSessions: number;
+  idleTtlMs: number;
+  questionTimeoutMs: number;
+  taskTimeoutMs: number;
+  startupTimeoutMs: number;
+  restartBudget: number;
+}
+
+export interface QoderProviderConfig extends ProviderBase {
+  type: 'qoder';
+  command: string;
+  args: string[];
+  /** 追加到 CLI 子进程的环境变量（如 ELECTRON_RUN_AS_NODE / QODER_PERSONAL_ACCESS_TOKEN）。 */
+  env: Record<string, string>;
+  workspace: string;
+  workspaceRoots: string[];
+  /** 传给 qoder 会话的权限模式（CLI 原生枚举）。 */
+  mode: 'default' | 'accept_edits' | 'dont_ask' | 'plan' | 'bypass_permissions' | 'auto';
+  maxWorkers: number;
+  maxConcurrentSessions: number;
+  idleTtlMs: number;
+  questionTimeoutMs: number;
+  taskTimeoutMs: number;
+  startupTimeoutMs: number;
+  restartBudget: number;
+}
+
+export type ProviderConfig =
+  | MockProviderConfig
+  | OpenAIProviderConfig
+  | OpenCodeProviderConfig
+  | ZcodeProviderConfig
+  | QoderProviderConfig;
 
 export interface CooldownConfig {
   authMs: number;
@@ -140,6 +199,19 @@ export interface CooldownConfig {
   networkMs: number;
   emptyStreamMs: number;
   maxMs: number;
+}
+
+export type RetryCategory = 'rate_limit' | 'server' | 'timeout' | 'network' | 'empty_stream';
+
+export interface RetryPolicyConfig {
+  enabled: boolean;
+  maxRetries: number;
+  initialDelayMs: number;
+  maxDelayMs: number;
+  jitterRatio: number;
+  retryOn: RetryCategory[];
+  respectRetryAfter: boolean;
+  maxTotalWaitMs: number;
 }
 
 export interface ResolvedConfig {
@@ -160,6 +232,7 @@ export interface ResolvedConfig {
   routing: {
     maxAttempts: number;
     cooldowns: CooldownConfig;
+    retry: RetryPolicyConfig;
     modelAliases: Record<string, string>;
     modelBlacklist: string[];
   };
@@ -180,6 +253,11 @@ export interface CatalogConfig {
   syncIntervalMs: number;
   /** 同步时是否按模型名推断 reasoning 能力。 */
   reasoningHints: boolean;
+  /**
+   * 严格能力模式：上游未声明能力时按保守值处理（reasoning=false）。
+   * 默认 false：未声明则放行，由上游报错后自动降级。
+   */
+  strictCapabilities: boolean;
 }
 
 const pricingSchema = z.object({
@@ -283,9 +361,13 @@ const openAIProviderSchema = z.object({
 const openCodeProviderSchema = z.object({
   ...providerBase,
   type: z.literal('opencode'),
+  flavor: z.enum(['opencode', 'kilo', 'codearts']).default('opencode'),
+  codearts_data_dir: z.string().min(1).optional(),
+  model_filter: z.array(z.string().min(1)).default([]),
   models: z.array(modelSchema).min(0),
   command: z.string().min(1).default('opencode'),
   args: z.array(z.string()).default([]),
+  env: z.record(z.string()).default({}),
   workspace: z.string().min(1).default('./workspace'),
   workspace_roots: z.array(z.string().min(1)).default([]),
   hostname: z.string().default('127.0.0.1'),
@@ -300,9 +382,50 @@ const openCodeProviderSchema = z.object({
   max_concurrent_sessions: z.number().int().min(1).max(64).default(4),
   idle_ttl_ms: z.number().int().positive().default(900000),
   memory_budget_mb: z.number().int().min(0).default(0),
-  question_timeout_ms: z.number().int().positive().default(600000),
+  question_timeout_ms: z.number().int().positive().default(7200000),
+  task_timeout_ms: z.number().int().positive().default(1800000),
+  first_byte_timeout_ms: z.number().int().min(0).default(120000),
+  stream_heartbeat_ms: z.number().int().min(0).default(10000),
+  event_debug_frames: z.number().int().min(0).max(1000).default(20),
+  startup_timeout_ms: z.number().int().positive().default(60000),
+  restart_budget: z.number().int().min(0).default(3),
+});
+
+const zcodeProviderSchema = z.object({
+  ...providerBase,
+  type: z.literal('zcode'),
+  command: z.string().min(1).default('node'),
+  args: z.array(z.string()).default([]),
+  env: z.record(z.string()).nullable().default({}),
+  workspace: z.string().min(1).default('./workspace'),
+  workspace_roots: z.array(z.string().min(1)).default([]),
+  mode: z.enum(['plan', 'build', 'edit', 'yolo', 'guarded']).default('build'),
+  max_workers: z.number().int().min(1).max(8).default(1),
+  max_concurrent_sessions: z.number().int().min(1).max(64).default(2),
+  idle_ttl_ms: z.number().int().positive().default(900000),
+  question_timeout_ms: z.number().int().positive().default(7200000),
   task_timeout_ms: z.number().int().positive().default(1800000),
   startup_timeout_ms: z.number().int().positive().default(60000),
+  restart_budget: z.number().int().min(0).default(3),
+});
+
+const qoderProviderSchema = z.object({
+  ...providerBase,
+  type: z.literal('qoder'),
+  command: z.string().min(1).default('qodercli'),
+  args: z.array(z.string()).default([]),
+  env: z.record(z.string()).nullable().default({}),
+  workspace: z.string().min(1).default('./workspace'),
+  workspace_roots: z.array(z.string().min(1)).default([]),
+  mode: z
+    .enum(['default', 'accept_edits', 'dont_ask', 'plan', 'bypass_permissions', 'auto'])
+    .default('auto'),
+  max_workers: z.number().int().min(1).max(8).default(1),
+  max_concurrent_sessions: z.number().int().min(1).max(64).default(2),
+  idle_ttl_ms: z.number().int().positive().default(900000),
+  question_timeout_ms: z.number().int().positive().default(7200000),
+  task_timeout_ms: z.number().int().positive().default(1800000),
+  startup_timeout_ms: z.number().int().positive().default(90000),
   restart_budget: z.number().int().min(0).default(3),
 });
 
@@ -310,6 +433,8 @@ const providerSchema = z.discriminatedUnion('type', [
   mockProviderSchema,
   openAIProviderSchema,
   openCodeProviderSchema,
+  zcodeProviderSchema,
+  qoderProviderSchema,
 ]);
 
 const cooldownsSchema = z
@@ -321,6 +446,27 @@ const cooldownsSchema = z
     network_ms: z.number().int().positive().default(10000),
     empty_stream_ms: z.number().int().positive().default(5000),
     max_ms: z.number().int().positive().default(1800000),
+  })
+  .default({});
+
+export const RETRY_CATEGORIES = [
+  'rate_limit',
+  'server',
+  'timeout',
+  'network',
+  'empty_stream',
+] as const;
+
+const retrySchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    max_retries: z.number().int().min(0).max(20).default(5),
+    initial_delay_ms: z.number().int().positive().default(500),
+    max_delay_ms: z.number().int().positive().default(10000),
+    jitter_ratio: z.number().min(0).max(1).default(0.1),
+    retry_on: z.array(z.enum(RETRY_CATEGORIES)).default([...RETRY_CATEGORIES]),
+    respect_retry_after: z.boolean().default(true),
+    max_total_wait_ms: z.number().int().positive().default(120000),
   })
   .default({});
 
@@ -349,6 +495,7 @@ const configSchema = z.object({
     .object({
       max_attempts: z.number().int().min(1).max(20).default(6),
       cooldowns: cooldownsSchema,
+      retry: retrySchema,
       model_aliases: z.record(z.string().min(1)).default({}),
       model_blacklist: z.array(z.string().min(1)).default([]),
     })
@@ -362,9 +509,10 @@ const configSchema = z.object({
     .object({
       sync_enabled: z.boolean().default(true),
       sync_on_start: z.boolean().default(true),
-      sync_interval_ms: z.number().int().positive().default(3600000),
-      reasoning_hints: z.boolean().default(true),
-    })
+    sync_interval_ms: z.number().int().positive().default(3600000),
+    reasoning_hints: z.boolean().default(true),
+    strict_capabilities: z.boolean().default(false),
+  })
     .default({}),
   health: z
     .object({
@@ -449,8 +597,12 @@ export function parseConfig(raw: unknown): ResolvedConfig {
       return {
         ...base,
         type: 'opencode',
+        flavor: p.flavor,
+        codeartsDataDir: p.codearts_data_dir,
+        modelFilter: p.model_filter,
         command: p.command,
         args: p.args,
+        env: p.env,
         workspace: p.workspace,
         workspaceRoots: p.workspace_roots,
         hostname: p.hostname,
@@ -465,6 +617,47 @@ export function parseConfig(raw: unknown): ResolvedConfig {
         maxConcurrentSessions: p.max_concurrent_sessions,
         idleTtlMs: p.idle_ttl_ms,
         memoryBudgetMb: p.memory_budget_mb,
+        questionTimeoutMs: p.question_timeout_ms,
+        taskTimeoutMs: p.task_timeout_ms,
+        firstByteTimeoutMs: p.first_byte_timeout_ms,
+        streamHeartbeatMs: p.stream_heartbeat_ms,
+        eventDebugFrames: p.event_debug_frames,
+        startupTimeoutMs: p.startup_timeout_ms,
+        restartBudget: p.restart_budget,
+      };
+    }
+    if (p.type === 'zcode') {
+      return {
+        ...base,
+        type: 'zcode',
+        command: p.command,
+        args: p.args,
+        env: p.env ?? {},
+        workspace: p.workspace,
+        workspaceRoots: p.workspace_roots,
+        mode: p.mode,
+        maxWorkers: p.max_workers,
+        maxConcurrentSessions: p.max_concurrent_sessions,
+        idleTtlMs: p.idle_ttl_ms,
+        questionTimeoutMs: p.question_timeout_ms,
+        taskTimeoutMs: p.task_timeout_ms,
+        startupTimeoutMs: p.startup_timeout_ms,
+        restartBudget: p.restart_budget,
+      };
+    }
+    if (p.type === 'qoder') {
+      return {
+        ...base,
+        type: 'qoder',
+        command: p.command,
+        args: p.args,
+        env: p.env ?? {},
+        workspace: p.workspace,
+        workspaceRoots: p.workspace_roots,
+        mode: p.mode,
+        maxWorkers: p.max_workers,
+        maxConcurrentSessions: p.max_concurrent_sessions,
+        idleTtlMs: p.idle_ttl_ms,
         questionTimeoutMs: p.question_timeout_ms,
         taskTimeoutMs: p.task_timeout_ms,
         startupTimeoutMs: p.startup_timeout_ms,
@@ -541,6 +734,16 @@ export function parseConfig(raw: unknown): ResolvedConfig {
       maxAttempts: cfg.routing.max_attempts,
       modelAliases: cfg.routing.model_aliases,
       modelBlacklist: cfg.routing.model_blacklist,
+      retry: {
+        enabled: cfg.routing.retry.enabled,
+        maxRetries: cfg.routing.retry.max_retries,
+        initialDelayMs: cfg.routing.retry.initial_delay_ms,
+        maxDelayMs: cfg.routing.retry.max_delay_ms,
+        jitterRatio: cfg.routing.retry.jitter_ratio,
+        retryOn: [...cfg.routing.retry.retry_on],
+        respectRetryAfter: cfg.routing.retry.respect_retry_after,
+        maxTotalWaitMs: cfg.routing.retry.max_total_wait_ms,
+      },
       cooldowns: {
         authMs: cfg.routing.cooldowns.auth_ms,
         rateLimitMs: cfg.routing.cooldowns.rate_limit_ms,
@@ -557,6 +760,7 @@ export function parseConfig(raw: unknown): ResolvedConfig {
       syncOnStart: cfg.catalog.sync_on_start,
       syncIntervalMs: cfg.catalog.sync_interval_ms,
       reasoningHints: cfg.catalog.reasoning_hints,
+      strictCapabilities: cfg.catalog.strict_capabilities,
     },
     health: {
       enabled: cfg.health.enabled,

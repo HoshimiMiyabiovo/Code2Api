@@ -4,11 +4,19 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { APP_VERSION } from '../config.js';
-import { deleteChannel, parseChannelInput, upsertChannel } from '../core/config-editor.js';
+import {
+  deleteChannel,
+  parseChannelInput,
+  parseRetryInput,
+  updateRetryPolicy,
+  upsertChannel,
+} from '../core/config-editor.js';
 import { maskKey } from '../core/keys.js';
 import type { ProviderMonitorSnapshot } from '../core/pool-supervisor.js';
 import { GatewayError } from '../errors.js';
 import { OpenCodeAdapter, type PendingQuestionView } from '../providers/opencode.js';
+import { QoderAdapter } from '../providers/qoder.js';
+import { ZcodeAdapter } from '../providers/zcode.js';
 import type { ProviderRuntime } from '../providers/registry.js';
 import type { ProviderKeyStats } from '../store/db.js';
 import type { GatewayContext } from './context.js';
@@ -38,6 +46,27 @@ function emptyStats(): ProviderKeyStats {
 
 function openCodeAdapterOf(provider: ProviderRuntime): OpenCodeAdapter | null {
   return provider.adapter instanceof OpenCodeAdapter ? provider.adapter : null;
+}
+
+/** 任何实现了 listPendingQuestions/answerQuestion 的适配器都可参与提问面板。 */
+function questionAdapterOf(provider: ProviderRuntime):
+  | {
+      listPendingQuestions: () => Array<Record<string, unknown>>;
+      answerQuestion: (id: string, raw: unknown) => Promise<void>;
+    }
+  | null {
+  const adapter = provider.adapter as unknown as Record<string, unknown>;
+  if (
+    adapter &&
+    typeof adapter.listPendingQuestions === 'function' &&
+    typeof adapter.answerQuestion === 'function'
+  ) {
+    return adapter as {
+      listPendingQuestions: () => Array<Record<string, unknown>>;
+      answerQuestion: (id: string, raw: unknown) => Promise<void>;
+    };
+  }
+  return null;
 }
 
 function channelView(
@@ -78,6 +107,9 @@ function channelView(
     opencode:
       config.type === 'opencode'
         ? {
+            flavor: config.flavor,
+            codeartsDataDir: config.codeartsDataDir ?? null,
+            modelFilter: config.modelFilter,
             command: config.command,
             workspace: config.workspace,
             workspaceRoots: config.workspaceRoots,
@@ -88,9 +120,44 @@ function channelView(
             maxConcurrentSessions: config.maxConcurrentSessions,
             idleTtlMs: config.idleTtlMs,
             memoryBudgetMb: config.memoryBudgetMb,
+            firstByteTimeoutMs: config.firstByteTimeoutMs,
+            streamHeartbeatMs: config.streamHeartbeatMs,
+            eventDebugFrames: config.eventDebugFrames,
             baseUrl: config.baseUrl ?? null,
             worker: adapter?.workerSnapshot() ?? null,
             pool: adapter?.poolSnapshot() ?? null,
+          }
+        : null,
+    zcode:
+      config.type === 'zcode'
+        ? {
+            command: config.command,
+            args: config.args,
+            env: config.env,
+            workspace: config.workspace,
+            workspaceRoots: config.workspaceRoots,
+            mode: config.mode,
+            maxWorkers: config.maxWorkers,
+            maxConcurrentSessions: config.maxConcurrentSessions,
+            idleTtlMs: config.idleTtlMs,
+            worker: (provider.adapter as ZcodeAdapter).workerSnapshot(),
+            pool: (provider.adapter as ZcodeAdapter).poolSnapshot(),
+          }
+        : null,
+    qoder:
+      config.type === 'qoder'
+        ? {
+            command: config.command,
+            args: config.args,
+            env: config.env,
+            workspace: config.workspace,
+            workspaceRoots: config.workspaceRoots,
+            mode: config.mode,
+            maxWorkers: config.maxWorkers,
+            maxConcurrentSessions: config.maxConcurrentSessions,
+            idleTtlMs: config.idleTtlMs,
+            worker: (provider.adapter as QoderAdapter).workerSnapshot(),
+            pool: (provider.adapter as QoderAdapter).poolSnapshot(),
           }
         : null,
     monitoring,
@@ -287,9 +354,9 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: GatewayContext): 
     '/admin/api/questions',
     { preHandler: adminGuard },
     async (_request: FastifyRequest, reply: FastifyReply) => {
-      const questions: PendingQuestionView[] = [];
+      const questions: Array<Record<string, unknown>> = [];
       for (const provider of ctx.registry.providers) {
-        const adapter = openCodeAdapterOf(provider);
+        const adapter = questionAdapterOf(provider);
         if (adapter) questions.push(...adapter.listPendingQuestions());
       }
       return reply.header('cache-control', 'no-store').send({ questions });
@@ -308,7 +375,7 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: GatewayContext): 
       }
       try {
         for (const provider of ctx.registry.providers) {
-          const adapter = openCodeAdapterOf(provider);
+          const adapter = questionAdapterOf(provider);
           if (!adapter) continue;
           if (!adapter.listPendingQuestions().some((item) => item.id === id)) continue;
           await adapter.answerQuestion(id, request.body);
@@ -457,11 +524,45 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: GatewayContext): 
         capabilities: entry.model.capabilities,
         pricing: entry.model.pricing ?? null,
         reasoningEffort: entry.model.reasoningEffort ?? null,
+        reasoningVariants: entry.model.reasoningVariants ?? null,
         source: entry.model.source ?? 'config',
       }));
       return reply
         .header('cache-control', 'no-store')
         .send({ models, sync: ctx.catalog.snapshot() });
+    },
+  );
+
+  app.get(
+    '/admin/api/retry',
+    { preHandler: adminGuard },
+    async (_request: FastifyRequest, reply: FastifyReply) => {
+      return reply
+        .header('cache-control', 'no-store')
+        .send({
+          editable: Boolean(ctx.configPath),
+          retry: ctx.config.routing.retry,
+        });
+    },
+  );
+
+  app.put(
+    '/admin/api/retry',
+    { preHandler: adminGuard },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      if (!ctx.configPath) {
+        return reply.code(400).send({
+          error: { message: '当前服务未加载配置文件路径，无法编辑重试配置', type: 'invalid_request_error' },
+        });
+      }
+      try {
+        const input = parseRetryInput(request.body);
+        const result = await updateRetryPolicy(ctx.configPath, input);
+        ctx.applyRetryConfig(result.config);
+        return reply.send({ ok: true, warnings: result.warnings });
+      } catch (error) {
+        return channelError(reply, error);
+      }
     },
   );
 }

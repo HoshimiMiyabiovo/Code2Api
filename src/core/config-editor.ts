@@ -1,13 +1,16 @@
 import { copyFileSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import YAML from 'yaml';
 import { z } from 'zod';import {
+  RETRY_CATEGORIES,
   parseConfig,
   type KeyConfig,
   type ModelConfig,
   type ModelPricing,
   type ProviderConfig,
+  type QoderProviderConfig,
   type ResolvedConfig,
   type Timeouts,
+  type ZcodeProviderConfig,
 } from '../config.js';
 import { GatewayError } from '../errors.js';
 
@@ -76,7 +79,7 @@ const channelInputSchema = z.object({
     .min(1)
     .max(64)
     .regex(/^[A-Za-z0-9._-]+$/, '渠道 id 仅支持字母、数字、. _ -'),
-  type: z.enum(['openai-compatible', 'mock', 'opencode']),
+  type: z.enum(['openai-compatible', 'mock', 'opencode', 'zcode', 'qoder']),
   priority: z.number().int().default(100),
   enabled: z.boolean().default(true),
   baseUrl: z.string().trim().url('base_url 必须是完整 URL').max(2048).optional(),
@@ -87,6 +90,23 @@ const channelInputSchema = z.object({
   defaultReasoningEffort: z.string().trim().min(1).max(32).optional(),
   reasoningBudgetField: z.string().trim().min(1).max(128).optional(),
   command: z.string().trim().min(1).max(1024).optional(),
+  args: z.array(z.string().trim().min(1).max(2048)).max(32).optional(),
+  env: z
+    .record(z.string().trim().min(1).max(4096))
+    .refine(
+      (value) => Object.keys(value).every((key) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key)),
+      '环境变量名仅支持字母、数字与下划线，且不能以数字开头',
+    )
+    .optional(),
+  flavor: z.enum(['opencode', 'kilo', 'codearts']).optional(),
+  codeartsDataDir: z.string().trim().min(1).max(1024).optional(),
+  modelFilter: z.array(z.string().trim().min(1).max(256)).max(64).optional(),
+  mode: z
+    .union([
+      z.enum(['plan', 'build', 'edit', 'yolo', 'guarded']),
+      z.enum(['default', 'accept_edits', 'dont_ask', 'plan', 'bypass_permissions', 'auto']),
+    ])
+    .optional(),
   workspace: z.string().trim().min(1).max(1024).optional(),
   workspaceRoots: z.array(z.string().trim().min(1).max(1024)).max(32).optional(),
   agent: z.string().trim().min(1).max(128).optional(),
@@ -96,11 +116,26 @@ const channelInputSchema = z.object({
   maxConcurrentSessions: z.number().int().min(1).max(64).optional(),
   idleTtlMs: z.number().int().positive().optional(),
   memoryBudgetMb: z.number().int().min(0).optional(),
+  firstByteTimeoutMs: z.number().int().min(0).max(86400000).optional(),
+  streamHeartbeatMs: z.number().int().min(0).max(3600000).optional(),
+  eventDebugFrames: z.number().int().min(0).max(1000).optional(),
   keys: z.array(keyInputSchema).default([]),
   models: z.array(modelInputSchema).default([]),
 });
 
+const retryInputSchema = z.object({
+  enabled: z.boolean(),
+  maxRetries: z.number().int().min(0).max(20),
+  initialDelayMs: z.number().int().min(1).max(3600000),
+  maxDelayMs: z.number().int().min(1).max(3600000),
+  jitterRatio: z.number().min(0).max(1),
+  retryOn: z.array(z.enum(RETRY_CATEGORIES)),
+  respectRetryAfter: z.boolean(),
+  maxTotalWaitMs: z.number().int().min(1).max(3600000),
+});
+
 export type ChannelInput = z.infer<typeof channelInputSchema>;
+export type RetryInput = z.infer<typeof retryInputSchema>;
 type KeyInput = z.infer<typeof keyInputSchema>;
 type ModelInput = z.infer<typeof modelInputSchema>;
 
@@ -115,6 +150,16 @@ function bad(message: string, status = 400, type = 'invalid_request_error'): nev
   throw new GatewayError(message, { status, type, code: 'config_invalid' });
 }
 
+const ZCODE_MODES: readonly string[] = ['plan', 'build', 'edit', 'yolo', 'guarded'];
+const QODER_MODES: readonly string[] = [
+  'default',
+  'accept_edits',
+  'dont_ask',
+  'plan',
+  'bypass_permissions',
+  'auto',
+];
+
 export function parseChannelInput(raw: unknown): ChannelInput {
   const result = channelInputSchema.safeParse(raw);
   if (!result.success) {
@@ -122,6 +167,20 @@ export function parseChannelInput(raw: unknown): ChannelInput {
       .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
       .join('；');
     bad(`渠道配置校验失败：${details}`);
+  }
+  return result.data;
+}
+
+export function parseRetryInput(raw: unknown): RetryInput {
+  const result = retryInputSchema.safeParse(raw);
+  if (!result.success) {
+    const details = result.error.issues
+      .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+      .join('；');
+    bad(`重试配置校验失败：${details}`);
+  }
+  if (result.data.maxDelayMs < result.data.initialDelayMs) {
+    bad('重试配置校验失败：maxDelayMs 不能小于 initialDelayMs');
   }
   return result.data;
 }
@@ -251,8 +310,12 @@ function buildProvider(input: ChannelInput, existing?: ProviderConfig): Provider
     return {
       ...base,
       type: 'opencode',
+      flavor: input.flavor ?? existingOc?.flavor ?? 'opencode',
+      codeartsDataDir: input.codeartsDataDir ?? existingOc?.codeartsDataDir,
+      modelFilter: input.modelFilter ?? existingOc?.modelFilter ?? [],
       command: input.command ?? existingOc?.command ?? 'opencode',
       args: existingOc?.args ?? [],
+      env: existingOc?.env ?? {},
       workspace: input.workspace ?? existingOc?.workspace ?? './workspace',
       workspaceRoots: input.workspaceRoots ?? existingOc?.workspaceRoots ?? [],
       hostname: existingOc?.hostname ?? '127.0.0.1',
@@ -270,10 +333,79 @@ function buildProvider(input: ChannelInput, existing?: ProviderConfig): Provider
         input.maxConcurrentSessions ?? existingOc?.maxConcurrentSessions ?? 4,
       idleTtlMs: input.idleTtlMs ?? existingOc?.idleTtlMs ?? 900000,
       memoryBudgetMb: input.memoryBudgetMb ?? existingOc?.memoryBudgetMb ?? 0,
-      questionTimeoutMs: existingOc?.questionTimeoutMs ?? 600000,
+      questionTimeoutMs: existingOc?.questionTimeoutMs ?? 7200000,
       taskTimeoutMs: existingOc?.taskTimeoutMs ?? 1800000,
+      firstByteTimeoutMs: input.firstByteTimeoutMs ?? existingOc?.firstByteTimeoutMs ?? 120000,
+      streamHeartbeatMs: input.streamHeartbeatMs ?? existingOc?.streamHeartbeatMs ?? 10000,
+      eventDebugFrames: input.eventDebugFrames ?? existingOc?.eventDebugFrames ?? 20,
       startupTimeoutMs: existingOc?.startupTimeoutMs ?? 60000,
       restartBudget: existingOc?.restartBudget ?? 3,
+    };
+  }
+  if (input.type === 'zcode') {
+    if (input.keys.length > 0) bad('zcode 渠道不需要密钥');
+    for (const model of models) {
+      if (!model.upstream.includes('/')) {
+        bad(`zcode 模型 ${model.id} 的 upstream 必须是 providerId/modelId`);
+      }
+    }
+    if (input.mode && !ZCODE_MODES.includes(input.mode)) {
+      bad(`zcode 渠道 mode 仅支持 ${ZCODE_MODES.join(' / ')}`);
+    }
+    const existingZc = existing?.type === 'zcode' ? existing : null;
+    const zcodeMode = input.mode
+      ? (input.mode as ZcodeProviderConfig['mode'])
+      : (existingZc?.mode ?? 'build');
+    return {
+      ...base,
+      type: 'zcode',
+      command: input.command ?? existingZc?.command ?? 'node',
+      args: input.args ?? existingZc?.args ?? [],
+      env: input.env ?? existingZc?.env ?? {},
+      workspace: input.workspace ?? existingZc?.workspace ?? './workspace',
+      workspaceRoots: input.workspaceRoots ?? existingZc?.workspaceRoots ?? [],
+      mode: zcodeMode,
+      maxWorkers: input.maxWorkers ?? existingZc?.maxWorkers ?? 1,
+      maxConcurrentSessions:
+        input.maxConcurrentSessions ?? existingZc?.maxConcurrentSessions ?? 2,
+      idleTtlMs: input.idleTtlMs ?? existingZc?.idleTtlMs ?? 900000,
+      questionTimeoutMs: existingZc?.questionTimeoutMs ?? 7200000,
+      taskTimeoutMs: existingZc?.taskTimeoutMs ?? 1800000,
+      startupTimeoutMs: existingZc?.startupTimeoutMs ?? 60000,
+      restartBudget: existingZc?.restartBudget ?? 3,
+    };
+  }
+  if (input.type === 'qoder') {
+    if (input.keys.length > 0) bad('qoder 渠道不需要密钥');
+    for (const model of models) {
+      if (!model.upstream.includes('/')) {
+        bad(`qoder 模型 ${model.id} 的 upstream 必须是 providerId/modelId`);
+      }
+    }
+    if (input.mode && !QODER_MODES.includes(input.mode)) {
+      bad(`qoder 渠道 mode 仅支持 ${QODER_MODES.join(' / ')}`);
+    }
+    const existingQd = existing?.type === 'qoder' ? existing : null;
+    const qoderMode = input.mode
+      ? (input.mode as QoderProviderConfig['mode'])
+      : (existingQd?.mode ?? 'auto');
+    return {
+      ...base,
+      type: 'qoder',
+      command: input.command ?? existingQd?.command ?? 'qodercli',
+      args: input.args ?? existingQd?.args ?? [],
+      env: input.env ?? existingQd?.env ?? {},
+      workspace: input.workspace ?? existingQd?.workspace ?? './workspace',
+      workspaceRoots: input.workspaceRoots ?? existingQd?.workspaceRoots ?? [],
+      mode: qoderMode,
+      maxWorkers: input.maxWorkers ?? existingQd?.maxWorkers ?? 1,
+      maxConcurrentSessions:
+        input.maxConcurrentSessions ?? existingQd?.maxConcurrentSessions ?? 2,
+      idleTtlMs: input.idleTtlMs ?? existingQd?.idleTtlMs ?? 900000,
+      questionTimeoutMs: existingQd?.questionTimeoutMs ?? 7200000,
+      taskTimeoutMs: existingQd?.taskTimeoutMs ?? 1800000,
+      startupTimeoutMs: existingQd?.startupTimeoutMs ?? 90000,
+      restartBudget: existingQd?.restartBudget ?? 3,
     };
   }
   if (!input.baseUrl) bad('openai-compatible 渠道需要填写 base_url');
@@ -395,6 +527,9 @@ function providerToRaw(provider: ProviderConfig): Record<string, unknown> {
       throw new Error(`渠道 ${provider.id} 密钥 ${key.label} 既无 key 也无 key_env`);
     });
   } else if (provider.type === 'opencode') {
+    if (provider.flavor !== 'opencode') raw.flavor = provider.flavor;
+    if (provider.codeartsDataDir) raw.codearts_data_dir = provider.codeartsDataDir;
+    if (provider.modelFilter.length > 0) raw.model_filter = provider.modelFilter;
     raw.command = provider.command;
     if (provider.args.length > 0) raw.args = provider.args;
     raw.workspace = provider.workspace;
@@ -411,6 +546,37 @@ function providerToRaw(provider: ProviderConfig): Record<string, unknown> {
     raw.max_concurrent_sessions = provider.maxConcurrentSessions;
     raw.idle_ttl_ms = provider.idleTtlMs;
     raw.memory_budget_mb = provider.memoryBudgetMb;
+    raw.question_timeout_ms = provider.questionTimeoutMs;
+    raw.task_timeout_ms = provider.taskTimeoutMs;
+    raw.first_byte_timeout_ms = provider.firstByteTimeoutMs;
+    raw.stream_heartbeat_ms = provider.streamHeartbeatMs;
+    raw.event_debug_frames = provider.eventDebugFrames;
+    raw.startup_timeout_ms = provider.startupTimeoutMs;
+    raw.restart_budget = provider.restartBudget;
+  } else if (provider.type === 'zcode') {
+    raw.command = provider.command;
+    if (provider.args.length > 0) raw.args = provider.args;
+    if (Object.keys(provider.env).length > 0) raw.env = provider.env;
+    raw.workspace = provider.workspace;
+    if (provider.workspaceRoots.length > 0) raw.workspace_roots = provider.workspaceRoots;
+    raw.mode = provider.mode;
+    raw.max_workers = provider.maxWorkers;
+    raw.max_concurrent_sessions = provider.maxConcurrentSessions;
+    raw.idle_ttl_ms = provider.idleTtlMs;
+    raw.question_timeout_ms = provider.questionTimeoutMs;
+    raw.task_timeout_ms = provider.taskTimeoutMs;
+    raw.startup_timeout_ms = provider.startupTimeoutMs;
+    raw.restart_budget = provider.restartBudget;
+  } else if (provider.type === 'qoder') {
+    raw.command = provider.command;
+    if (provider.args.length > 0) raw.args = provider.args;
+    if (Object.keys(provider.env).length > 0) raw.env = provider.env;
+    raw.workspace = provider.workspace;
+    if (provider.workspaceRoots.length > 0) raw.workspace_roots = provider.workspaceRoots;
+    raw.mode = provider.mode;
+    raw.max_workers = provider.maxWorkers;
+    raw.max_concurrent_sessions = provider.maxConcurrentSessions;
+    raw.idle_ttl_ms = provider.idleTtlMs;
     raw.question_timeout_ms = provider.questionTimeoutMs;
     raw.task_timeout_ms = provider.taskTimeoutMs;
     raw.startup_timeout_ms = provider.startupTimeoutMs;
@@ -463,20 +629,10 @@ function readConfigDocument(configPath: string): {
   return { doc, config };
 }
 
-function persistProviders(
+function writeConfigDocument(
   configPath: string,
   doc: YamlDocument,
-  providers: ProviderConfig[],
 ): ResolvedConfig {
-  const rawProviders = providers.map(providerToRaw);
-  const baseRaw = doc.toJS() as Record<string, unknown>;
-  try {
-    parseConfig({ ...baseRaw, providers: rawProviders });
-  } catch (error) {
-    bad((error as Error).message, 400, 'config_invalid');
-  }
-
-  doc.set('providers', rawProviders);
   const output = doc.toString({ lineWidth: 0 });
   let finalConfig: ResolvedConfig;
   try {
@@ -503,6 +659,23 @@ function persistProviders(
     bad(`写入配置文件失败：${(error as Error).message}`, 500, 'config_write_error');
   }
   return finalConfig;
+}
+
+function persistProviders(
+  configPath: string,
+  doc: YamlDocument,
+  providers: ProviderConfig[],
+): ResolvedConfig {
+  const rawProviders = providers.map(providerToRaw);
+  const baseRaw = doc.toJS() as Record<string, unknown>;
+  try {
+    parseConfig({ ...baseRaw, providers: rawProviders });
+  } catch (error) {
+    bad((error as Error).message, 400, 'config_invalid');
+  }
+
+  doc.set('providers', rawProviders);
+  return writeConfigDocument(configPath, doc);
 }
 
 let writeQueue: Promise<unknown> = Promise.resolve();
@@ -551,6 +724,41 @@ export function deleteChannel(configPath: string, id: string): Promise<SaveChann
     }
     const providers = config.providers.filter((provider) => provider.id !== id);
     const nextConfig = persistProviders(configPath, doc, providers);
+    return { config: nextConfig, warnings: collectWarnings(nextConfig) };
+  });
+}
+
+export function updateRetryPolicy(
+  configPath: string,
+  input: RetryInput,
+): Promise<SaveChannelResult> {
+  return exclusive(() => {
+    const { doc } = readConfigDocument(configPath);
+    const retryRaw = {
+      enabled: input.enabled,
+      max_retries: input.maxRetries,
+      initial_delay_ms: input.initialDelayMs,
+      max_delay_ms: input.maxDelayMs,
+      jitter_ratio: input.jitterRatio,
+      retry_on: input.retryOn,
+      respect_retry_after: input.respectRetryAfter,
+      max_total_wait_ms: input.maxTotalWaitMs,
+    };
+    const baseRaw = doc.toJS() as Record<string, unknown>;
+    const routingRaw =
+      baseRaw.routing && typeof baseRaw.routing === 'object'
+        ? (baseRaw.routing as Record<string, unknown>)
+        : {};
+    try {
+      parseConfig({
+        ...baseRaw,
+        routing: { ...routingRaw, retry: retryRaw },
+      });
+    } catch (error) {
+      bad((error as Error).message, 400, 'config_invalid');
+    }
+    doc.setIn(['routing', 'retry'], retryRaw);
+    const nextConfig = writeConfigDocument(configPath, doc);
     return { config: nextConfig, warnings: collectWarnings(nextConfig) };
   });
 }

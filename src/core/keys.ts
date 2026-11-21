@@ -113,9 +113,15 @@ export class KeyPool {
     const base = baseCooldownMs(category, cooldowns);
     if (base <= 0) return;
     key.consecutiveFailures += 1;
-    const exponent = Math.min(key.consecutiveFailures - 1, 5);
+    const exponent = Math.min(key.consecutiveFailures - 1, 3);
     const backoff = Math.min(base * 2 ** exponent, cooldowns.maxMs);
-    key.cooldownUntil = Date.now() + Math.max(backoff, retryAfterMs ?? 0);
+    // 上游明确给出 Retry-After 时直接采用（仍受 maxMs 封顶），
+    // 不再与指数翻倍取 max——否则上游的小窗口会被本地滚雪球放大。
+    const cooldownMs =
+      retryAfterMs !== undefined && retryAfterMs > 0
+        ? Math.min(retryAfterMs, cooldowns.maxMs)
+        : backoff;
+    key.cooldownUntil = Date.now() + cooldownMs;
   }
 
   earliestCooldown(now = Date.now()): number | null {

@@ -9,13 +9,16 @@ import { loadConfig } from '../src/config.js';
 import { createGateway, type Gateway } from '../src/http/app.js';
 
 interface FakeOptions {
-  models?: Array<string | { id: string; context_length?: number }>;
+  models?: Array<
+    string | { id: string; context_length?: number; supported_parameters?: string[] }
+  >;
   rejectReasoning?: boolean;
 }
 
 interface FakeUpstream {
   baseUrl: string;
   bodies: Record<string, unknown>[];
+  setModels: (models: NonNullable<FakeOptions['models']>) => void;
   close: () => Promise<void>;
 }
 
@@ -27,9 +30,10 @@ async function readBody(req: IncomingMessage): Promise<string> {
 
 async function startFake(options: FakeOptions = {}): Promise<FakeUpstream> {
   const bodies: Record<string, unknown>[] = [];
+  let currentModels = options.models ?? [];
   const server: Server = createServer(async (req, res) => {
     if (req.method === 'GET' && req.url?.endsWith('/models')) {
-      const models = (options.models ?? []).map((item) =>
+      const models = currentModels.map((item) =>
         typeof item === 'string'
           ? { id: item, object: 'model', owned_by: 'fake' }
           : {
@@ -37,6 +41,7 @@ async function startFake(options: FakeOptions = {}): Promise<FakeUpstream> {
               object: 'model',
               owned_by: 'fake',
               context_length: item.context_length,
+              supported_parameters: item.supported_parameters,
             },
       );
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -108,6 +113,9 @@ async function startFake(options: FakeOptions = {}): Promise<FakeUpstream> {
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
     bodies,
+    setModels: (models) => {
+      currentModels = models;
+    },
     close: async () => {
       await new Promise<void>((resolve) => {
         server.close(() => resolve());
@@ -176,9 +184,9 @@ async function chat(
 test('模型目录同步：拉取上游 /models 并合并，手工配置优先', async () => {
   const fake = await startFake({
     models: [
-      'sync-new-model',
+      { id: 'sync-new-model', supported_parameters: ['tools', 'reasoning'] },
       { id: 'upstream-model', context_length: 131072 },
-      { id: 'ctx-model', context_length: 200000 },
+      { id: 'ctx-model', context_length: 200000, supported_parameters: ['tools'] },
     ],
   });
   const harness = await startGateway(`
@@ -216,6 +224,7 @@ providers:
     const synced = admin.models.find((m: any) => m.id === 'sync-new-model');
     assert.equal(synced.source, 'upstream');
     assert.equal(synced.contextWindow, null);
+    assert.equal(synced.capabilities.reasoning, true);
     const manual = admin.models.find((m: any) => m.id === 'configured');
     assert.equal(manual.source, 'config');
     assert.equal(manual.capabilities.reasoning, true);
@@ -223,6 +232,7 @@ providers:
     const withContext = admin.models.find((m: any) => m.id === 'ctx-model');
     assert.equal(withContext.source, 'upstream');
     assert.equal(withContext.contextWindow, 200000);
+    assert.equal(withContext.capabilities.reasoning, false);
     assert.equal(admin.sync.lastAdded, 2);
 
     const response = await chat(harness, {
@@ -231,6 +241,105 @@ providers:
     });
     assert.equal(response.status, 200);
     assert.equal(response.body.choices[0].message.content, 'Hello hi');
+  } finally {
+    await harness.close();
+    await fake.close();
+  }
+});
+
+test('上下文窗口自动最大值：留空取目录最大，手工值优先', async () => {
+  const fake = await startFake({
+    models: [{ id: 'grow-model', context_length: 131072 }],
+  });
+  const yaml = `
+server:
+  port: 0
+admin:
+  token: test-admin
+storage:
+  path: __DB__
+catalog:
+  sync_enabled: true
+  sync_on_start: true
+providers:
+  - id: fake
+    type: openai-compatible
+    base_url: ${fake.baseUrl}/v1
+    keys:
+      - label: good
+        key: ok-key
+    models:
+      - id: pinned
+        upstream: grow-model
+        context_window: 1000000
+        capabilities:
+          tools: true
+`;
+  const harness = await startGateway(yaml);
+  try {
+    // 手工条目留空的 auto-grow 由目录发现；pinned 手工 1M 不被目录 131072 覆盖。
+    fake.setModels([
+      { id: 'grow-model', context_length: 131072 },
+      { id: 'auto-grow', context_length: 131072 },
+    ]);
+    // 通过渠道保存触发热加载 + 重新同步（与面板行为一致）。
+    const save = async () => {
+      const response = await fetch(`${harness.base}/admin/api/channels/fake`, {
+        method: 'PUT',
+        headers: {
+          authorization: `Bearer ${harness.adminToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          id: 'fake',
+          type: 'openai-compatible',
+          baseUrl: `${fake.baseUrl}/v1`,
+          keys: [{ action: 'keep', label: 'good' }],
+          models: [
+            {
+              id: 'pinned',
+              upstream: 'grow-model',
+              contextWindow: 1000000,
+              capabilities: { tools: true },
+            },
+          ],
+        }),
+      });
+      assert.equal(response.status, 200);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    };
+    await save();
+    let admin = await adminGet(harness, '/admin/api/models');
+    assert.equal(
+      admin.models.find((m: any) => m.id === 'auto-grow').contextWindow,
+      131072,
+    );
+    assert.equal(admin.models.find((m: any) => m.id === 'pinned').contextWindow, 1000000);
+
+    // 目录声明变大：auto-grow 自动升到 262144；pinned 保持手工 1M。
+    fake.setModels([
+      { id: 'grow-model', context_length: 262144 },
+      { id: 'auto-grow', context_length: 262144 },
+    ]);
+    await save();
+    admin = await adminGet(harness, '/admin/api/models');
+    assert.equal(
+      admin.models.find((m: any) => m.id === 'auto-grow').contextWindow,
+      262144,
+    );
+    assert.equal(admin.models.find((m: any) => m.id === 'pinned').contextWindow, 1000000);
+
+    // 目录声明回落：热加载重建后回到当前目录声明值（262144 → 65536）。
+    fake.setModels([
+      { id: 'grow-model', context_length: 65536 },
+      { id: 'auto-grow', context_length: 65536 },
+    ]);
+    await save();
+    admin = await adminGet(harness, '/admin/api/models');
+    assert.equal(
+      admin.models.find((m: any) => m.id === 'auto-grow').contextWindow,
+      65536,
+    );
   } finally {
     await harness.close();
     await fake.close();
@@ -497,6 +606,92 @@ providers:
     assert.equal(fake.bodies[1]?.reasoning_effort, undefined);
   } finally {
     await harness.close();
+    await fake.close();
+  }
+});
+
+test('同步能力策略：未声明默认放行，strict 模式按不支持拒绝', async () => {
+  const fake = await startFake({ models: ['qwen4-max:free'] });
+
+  const permissive = await startGateway(`
+server:
+  port: 0
+admin:
+  token: test-admin
+storage:
+  path: __DB__
+catalog:
+  sync_enabled: true
+  sync_on_start: true
+providers:
+  - id: fake
+    type: openai-compatible
+    base_url: ${fake.baseUrl}/v1
+    keys:
+      - label: good
+        key: ok-key
+    models:
+      - id: placeholder
+        capabilities:
+          tools: true
+          vision: false
+          reasoning: false
+`);
+  try {
+    const admin = await adminGet(permissive, '/admin/api/models');
+    const synced = admin.models.find((m: any) => m.id === 'qwen4-max:free');
+    assert.equal(synced.capabilities.reasoning, true);
+
+    const ok = await chat(permissive, {
+      model: 'qwen4-max:free',
+      messages: [{ role: 'user', content: 'hi' }],
+      reasoning_effort: 'high',
+    });
+    assert.equal(ok.status, 200);
+  } finally {
+    await permissive.close();
+  }
+
+  const strict = await startGateway(`
+server:
+  port: 0
+admin:
+  token: test-admin
+storage:
+  path: __DB__
+catalog:
+  sync_enabled: true
+  sync_on_start: true
+  strict_capabilities: true
+  reasoning_hints: false
+providers:
+  - id: fake
+    type: openai-compatible
+    base_url: ${fake.baseUrl}/v1
+    keys:
+      - label: good
+        key: ok-key
+    models:
+      - id: placeholder
+        capabilities:
+          tools: true
+          vision: false
+          reasoning: false
+`);
+  try {
+    const admin = await adminGet(strict, '/admin/api/models');
+    const synced = admin.models.find((m: any) => m.id === 'qwen4-max:free');
+    assert.equal(synced.capabilities.reasoning, false);
+
+    const rejected = await chat(strict, {
+      model: 'qwen4-max:free',
+      messages: [{ role: 'user', content: 'hi' }],
+      reasoning_effort: 'high',
+    });
+    assert.equal(rejected.status, 400);
+    assert.equal(rejected.body.error.code, 'capability_mismatch');
+  } finally {
+    await strict.close();
     await fake.close();
   }
 });

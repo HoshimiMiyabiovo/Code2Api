@@ -12,7 +12,12 @@ import { estimateRequestTokens, roughTokenEstimate } from '../canonical.js';
 import type { ModelConfig, OpenAIProviderConfig } from '../config.js';
 import { UpstreamError } from '../errors.js';
 import { APP_VERSION } from '../config.js';
-import type { ChatContext, ProviderAdapter, UpstreamModelInfo } from './types.js';
+import type {
+  ChatContext,
+  DetectedCapabilities,
+  ProviderAdapter,
+  UpstreamModelInfo,
+} from './types.js';
 
 interface OpenAIChunkChoice {
   delta?: {
@@ -178,6 +183,39 @@ function detectContextWindow(item: Record<string, unknown>): number | undefined 
     }
   }
   return undefined;
+}
+
+/**
+ * 从上游 /models 条目解析显式能力声明。
+ * 主要识别 OpenRouter 风格的 supported_parameters，以及 input_modalities / modality 中的图像。
+ */
+function detectCapabilities(item: Record<string, unknown>): DetectedCapabilities {
+  const result: DetectedCapabilities = {};
+  const params = item.supported_parameters;
+  if (Array.isArray(params) && params.length > 0) {
+    const set = new Set(params.filter((p): p is string => typeof p === 'string'));
+    result.tools = set.has('tools');
+    result.reasoning = set.has('reasoning');
+  }
+
+  const modalities: unknown[] = [];
+  for (const key of ['input_modalities', 'output_modalities']) {
+    const value = item[key];
+    if (Array.isArray(value)) modalities.push(...value);
+  }
+  const architecture = item.architecture;
+  if (architecture && typeof architecture === 'object' && !Array.isArray(architecture)) {
+    const value = (architecture as Record<string, unknown>).input_modalities;
+    if (Array.isArray(value)) modalities.push(...value);
+  }
+  const modality = typeof item.modality === 'string' ? item.modality.toLowerCase() : '';
+  if (
+    modalities.some((m) => m === 'image' || m === 'image_url' || m === 'vision') ||
+    modality.includes('image')
+  ) {
+    result.vision = true;
+  }
+  return result;
 }
 
 /** 按点号路径写字段，例如 "reasoning.max_tokens"。 */
@@ -671,7 +709,11 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
             const record = item as Record<string, unknown>;
             const id = record.id;
             if (typeof id === 'string' && id) {
-              models.push({ id, contextWindow: detectContextWindow(record) });
+              models.push({
+                id,
+                contextWindow: detectContextWindow(record),
+                capabilities: detectCapabilities(record),
+              });
             }
           }
         }

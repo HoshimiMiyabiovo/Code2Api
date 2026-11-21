@@ -125,7 +125,8 @@ export function registerResponsesRoutes(app: FastifyInstance, ctx: GatewayContex
         );
         const payload = encodeResponsesResponse(result, parsed.previousResponseId);
         persist(payload, result.text, result.thinking, result.toolCalls);
-        const usage = outcome.response.usage;
+        // 记账/计费用上游真实消耗（桥接多 step 累加）；客户端编码仍用 response.usage。
+        const usage = outcome.response.upstreamUsage ?? outcome.response.usage;
         recordRequest(ctx, meta, {
           status: 'ok',
           providerId: outcome.providerId,

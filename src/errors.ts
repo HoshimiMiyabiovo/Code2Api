@@ -44,6 +44,7 @@ export class GatewayError extends Error {
   readonly status: number;
   readonly type: string;
   readonly code?: string;
+  readonly retryAfterMs?: number;
   readonly retryAfterSeconds?: number;
   readonly providerId?: string;
   readonly keyLabel?: string;
@@ -55,6 +56,7 @@ export class GatewayError extends Error {
       status?: number;
       type?: string;
       code?: string;
+      retryAfterMs?: number;
       retryAfterSeconds?: number;
       providerId?: string;
       keyLabel?: string;
@@ -66,6 +68,7 @@ export class GatewayError extends Error {
     this.status = opts.status ?? 502;
     this.type = opts.type ?? 'upstream_error';
     this.code = opts.code;
+    this.retryAfterMs = opts.retryAfterMs;
     this.retryAfterSeconds = opts.retryAfterSeconds;
     this.providerId = opts.providerId;
     this.keyLabel = opts.keyLabel;

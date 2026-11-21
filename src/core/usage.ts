@@ -12,11 +12,14 @@ function charsToTokens(chars: number): number {
 
 export class UsageCollector {
   private usage: Usage | null = null;
+  /** 桥接任务的累加消耗（多 step），记账用；与客户端可见的 usage 分离。 */
+  private upstreamUsage: Usage | null = null;
   private outputChars = 0;
   private thinkingChars = 0;
 
   observe(event: StreamEvent): void {
     if (event.type === 'usage') {
+      if (event.upstreamUsage) this.upstreamUsage = event.upstreamUsage;
       if (event.usage.inputTokens > 0 || event.usage.outputTokens > 0 || this.usage === null) {
         this.usage = event.usage;
       }
@@ -30,6 +33,7 @@ export class UsageCollector {
   }
 
   finalize(request: CanonicalRequest): Usage {
+    if (this.upstreamUsage) return this.upstreamUsage;
     if (this.usage && (this.usage.inputTokens > 0 || this.usage.outputTokens > 0)) {
       return this.usage;
     }

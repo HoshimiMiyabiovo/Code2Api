@@ -37,6 +37,12 @@ export interface Totals {
   inputTokens: number;
   outputTokens: number;
   reasoningTokens: number;
+  /** 未缓存输入（行级启发式拆分，见 totalsStmt 注释）。 */
+  uncachedInputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  /** 输出 + 推理（生成侧合计）。 */
+  generatedTokens: number;
   costUsd: number;
   avgLatencyMs: number | null;
   avgTtfbMs: number | null;
@@ -91,6 +97,74 @@ export interface OcQuestionRow {
   gatewaySessionId: string;
   providerId: string;
   ocSessionId: string;
+  kind: 'form' | 'permission';
+  requestId: string;
+  payload: unknown;
+  status: string;
+  createdAt: number;
+  answeredAt: number | null;
+  answer: unknown;
+}
+
+export interface ZcSessionRow {
+  gatewaySessionId: string;
+  providerId: string;
+  zcSessionId: string;
+  modelPublic: string;
+  modelUpstream: string;
+  workspace: string | null;
+  oneShot: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ZcLedgerRow {
+  msgId: string;
+  role: string;
+  text: string;
+  delivered: boolean;
+  createdAt: number;
+}
+
+export interface ZcQuestionRow {
+  id: string;
+  gatewaySessionId: string;
+  providerId: string;
+  zcSessionId: string;
+  kind: 'form' | 'permission';
+  requestId: string;
+  payload: unknown;
+  status: string;
+  createdAt: number;
+  answeredAt: number | null;
+  answer: unknown;
+}
+
+export interface QdSessionRow {
+  gatewaySessionId: string;
+  providerId: string;
+  qdSessionId: string;
+  modelPublic: string;
+  modelUpstream: string;
+  workspace: string | null;
+  oneShot: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface QdLedgerRow {
+  msgId: string;
+  role: string;
+  text: string;
+  delivered: boolean;
+  createdAt: number;
+}
+
+export interface QdQuestionRow {
+  id: string;
+  gatewaySessionId: string;
+  providerId: string;
+  qdSessionId: string;
   kind: 'form' | 'permission';
   requestId: string;
   payload: unknown;
@@ -218,6 +292,102 @@ CREATE TABLE IF NOT EXISTS oc_questions (
   answer TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_oc_questions_status ON oc_questions(status);
+CREATE TABLE IF NOT EXISTS zc_sessions (
+  gateway_session_id TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  zc_session_id TEXT NOT NULL,
+  model_public TEXT NOT NULL,
+  model_upstream TEXT NOT NULL,
+  workspace TEXT,
+  one_shot INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (gateway_session_id, provider_id)
+);
+CREATE TABLE IF NOT EXISTS zc_ledger (
+  gateway_session_id TEXT NOT NULL,
+  msg_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  text TEXT NOT NULL,
+  delivered INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (gateway_session_id, msg_id)
+);
+CREATE INDEX IF NOT EXISTS idx_zc_ledger_delivered ON zc_ledger(gateway_session_id, delivered);
+CREATE TABLE IF NOT EXISTS zc_tasks (
+  id TEXT PRIMARY KEY,
+  gateway_session_id TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  zc_session_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  finished_at INTEGER,
+  error TEXT,
+  usage_json TEXT
+);
+CREATE TABLE IF NOT EXISTS zc_questions (
+  id TEXT PRIMARY KEY,
+  gateway_session_id TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  zc_session_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  answered_at INTEGER,
+  answer TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_zc_questions_status ON zc_questions(status);
+CREATE TABLE IF NOT EXISTS qd_sessions (
+  gateway_session_id TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  qd_session_id TEXT NOT NULL,
+  model_public TEXT NOT NULL,
+  model_upstream TEXT NOT NULL,
+  workspace TEXT,
+  one_shot INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (gateway_session_id, provider_id)
+);
+CREATE TABLE IF NOT EXISTS qd_ledger (
+  gateway_session_id TEXT NOT NULL,
+  msg_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  text TEXT NOT NULL,
+  delivered INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (gateway_session_id, msg_id)
+);
+CREATE INDEX IF NOT EXISTS idx_qd_ledger_delivered ON qd_ledger(gateway_session_id, delivered);
+CREATE TABLE IF NOT EXISTS qd_tasks (
+  id TEXT PRIMARY KEY,
+  gateway_session_id TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  qd_session_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  finished_at INTEGER,
+  error TEXT,
+  usage_json TEXT
+);
+CREATE TABLE IF NOT EXISTS qd_questions (
+  id TEXT PRIMARY KEY,
+  gateway_session_id TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  qd_session_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  answered_at INTEGER,
+  answer TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_qd_questions_status ON qd_questions(status);
 CREATE TABLE IF NOT EXISTS response_store (
   id TEXT PRIMARY KEY,
   created_at INTEGER NOT NULL,
@@ -296,6 +466,16 @@ export class Store {
         COALESCE(SUM(input_tokens), 0) AS input_tokens,
         COALESCE(SUM(output_tokens), 0) AS output_tokens,
         COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+        -- 上游缓存语义不同：openai-compatible 的 prompt_tokens 含缓存（cached ⊆ prompt），
+        -- opencode/zcode 桥接的 input 不含缓存（cache 独立累加，可远大于 input）。
+        -- 行级启发式：cache_read > input 视为独立口径（未缓存=input），否则按 cached ⊆ prompt 扣减。
+        COALESCE(SUM(
+          CASE WHEN cache_read_tokens > input_tokens THEN input_tokens
+               ELSE MAX(input_tokens - cache_read_tokens, 0) END
+        ), 0) AS uncached_input_tokens,
+        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+        COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+        COALESCE(SUM(output_tokens + reasoning_tokens), 0) AS generated_tokens,
         COALESCE(SUM(cost_usd), 0) AS cost_usd,
         AVG(CASE WHEN status = 'ok' THEN latency_ms END) AS avg_latency_ms,
         AVG(CASE WHEN status = 'ok' THEN ttfb_ms END) AS avg_ttfb_ms
@@ -360,6 +540,10 @@ export class Store {
       inputTokens: num(row?.input_tokens),
       outputTokens: num(row?.output_tokens),
       reasoningTokens: num(row?.reasoning_tokens),
+      uncachedInputTokens: num(row?.uncached_input_tokens),
+      cacheReadTokens: num(row?.cache_read_tokens),
+      cacheWriteTokens: num(row?.cache_write_tokens),
+      generatedTokens: num(row?.generated_tokens),
       costUsd: num(row?.cost_usd),
       avgLatencyMs: nullableNum(row?.avg_latency_ms),
       avgTtfbMs: nullableNum(row?.avg_ttfb_ms),
@@ -639,6 +823,454 @@ export class Store {
       answeredAt: nullableNum(row.answered_at),
       answer: safeJson(row.answer),
     }));
+  }
+
+  upsertZcSession(row: ZcSessionRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO zc_sessions
+          (gateway_session_id, provider_id, zc_session_id, model_public, model_upstream, workspace, one_shot, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(gateway_session_id, provider_id) DO UPDATE SET
+           zc_session_id = excluded.zc_session_id,
+           model_public = excluded.model_public,
+           model_upstream = excluded.model_upstream,
+           workspace = excluded.workspace,
+           one_shot = excluded.one_shot,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        row.gatewaySessionId,
+        row.providerId,
+        row.zcSessionId,
+        row.modelPublic,
+        row.modelUpstream,
+        row.workspace ?? null,
+        row.oneShot ? 1 : 0,
+        row.createdAt,
+        row.updatedAt,
+      );
+  }
+
+  getZcSession(gatewaySessionId: string, providerId: string): ZcSessionRow | null {
+    const row = this.db
+      .prepare(`SELECT * FROM zc_sessions WHERE gateway_session_id = ? AND provider_id = ?`)
+      .get(gatewaySessionId, providerId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      gatewaySessionId: String(row.gateway_session_id),
+      providerId: String(row.provider_id),
+      zcSessionId: String(row.zc_session_id),
+      modelPublic: String(row.model_public),
+      modelUpstream: String(row.model_upstream),
+      workspace: nullableStr(row.workspace),
+      oneShot: num(row.one_shot) === 1,
+      createdAt: num(row.created_at),
+      updatedAt: num(row.updated_at),
+    };
+  }
+
+  deleteZcSession(gatewaySessionId: string, providerId: string): void {
+    this.db
+      .prepare(`DELETE FROM zc_sessions WHERE gateway_session_id = ? AND provider_id = ?`)
+      .run(gatewaySessionId, providerId);
+  }
+
+  insertZcLedgerMessages(
+    gatewaySessionId: string,
+    items: Array<{ msgId: string; role: string; text: string }>,
+  ): void {
+    const stmt = this.db.prepare(
+      `INSERT OR IGNORE INTO zc_ledger
+        (gateway_session_id, msg_id, role, text, delivered, created_at)
+       VALUES (?, ?, ?, ?, 0, ?)`,
+    );
+    const now = Date.now();
+    for (const item of items) {
+      stmt.run(gatewaySessionId, item.msgId, item.role, item.text, now);
+    }
+  }
+
+  getUndeliveredZcLedger(gatewaySessionId: string): ZcLedgerRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM zc_ledger WHERE gateway_session_id = ? AND delivered = 0 AND role IN ('user', 'system')
+         ORDER BY created_at ASC, rowid ASC`,
+      )
+      .all(gatewaySessionId) as Record<string, unknown>[];
+    return rows.map((row) => ({
+      msgId: String(row.msg_id),
+      role: String(row.role),
+      text: String(row.text),
+      delivered: false,
+      createdAt: num(row.created_at),
+    }));
+  }
+
+  getLastUserZcLedger(gatewaySessionId: string): ZcLedgerRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM zc_ledger WHERE gateway_session_id = ? AND role = 'user'
+         ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      )
+      .get(gatewaySessionId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      msgId: String(row.msg_id),
+      role: String(row.role),
+      text: String(row.text),
+      delivered: num(row.delivered) === 1,
+      createdAt: num(row.created_at),
+    };
+  }
+
+  markAllZcLedgerDelivered(gatewaySessionId: string): void {
+    this.db
+      .prepare(
+        `UPDATE zc_ledger SET delivered = 1 WHERE gateway_session_id = ? AND delivered = 0`,
+      )
+      .run(gatewaySessionId);
+  }
+
+  resetZcLedgerDelivered(gatewaySessionId: string): void {
+    this.db
+      .prepare(`UPDATE zc_ledger SET delivered = 0 WHERE gateway_session_id = ?`)
+      .run(gatewaySessionId);
+  }
+
+  appendAssistantZcLedger(gatewaySessionId: string, text: string): void {
+    if (!text) return;
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO zc_ledger
+          (gateway_session_id, msg_id, role, text, delivered, created_at)
+         VALUES (?, ?, 'assistant', ?, 1, ?)`,
+      )
+      .run(
+        gatewaySessionId,
+        `assistant-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        text,
+        Date.now(),
+      );
+  }
+
+  recordZcTask(row: {
+    id: string;
+    gatewaySessionId: string;
+    providerId: string;
+    zcSessionId: string;
+    state: string;
+    createdAt: number;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO zc_tasks
+          (id, gateway_session_id, provider_id, zc_session_id, state, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        row.id,
+        row.gatewaySessionId,
+        row.providerId,
+        row.zcSessionId,
+        row.state,
+        row.createdAt,
+        row.createdAt,
+      );
+  }
+
+  updateZcTask(
+    id: string,
+    state: string,
+    error?: string | null,
+    usage?: unknown,
+  ): void {
+    const finished = state === 'finished' || state === 'failed' || state === 'interrupted';
+    this.db
+      .prepare(
+        `UPDATE zc_tasks SET state = ?, updated_at = ?, finished_at = COALESCE(?, finished_at),
+           error = ?, usage_json = ? WHERE id = ?`,
+      )
+      .run(
+        state,
+        Date.now(),
+        finished ? Date.now() : null,
+        error ?? null,
+        usage === undefined ? null : JSON.stringify(usage),
+        id,
+      );
+  }
+
+  markStaleZcState(): void {
+    const now = Date.now();
+    this.db
+      .prepare(
+        `UPDATE zc_tasks SET state = 'interrupted', updated_at = ?, finished_at = ?
+         WHERE state IN ('running', 'suspended')`,
+      )
+      .run(now, now);
+    this.db
+      .prepare(`UPDATE zc_questions SET status = 'expired' WHERE status = 'pending'`)
+      .run();
+  }
+
+  createZcQuestion(row: {
+    id: string;
+    gatewaySessionId: string;
+    providerId: string;
+    zcSessionId: string;
+    kind: 'form' | 'permission';
+    requestId: string;
+    payload: unknown;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO zc_questions
+          (id, gateway_session_id, provider_id, zc_session_id, kind, request_id, payload, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+      )
+      .run(
+        row.id,
+        row.gatewaySessionId,
+        row.providerId,
+        row.zcSessionId,
+        row.kind,
+        row.requestId,
+        JSON.stringify(row.payload),
+        Date.now(),
+      );
+  }
+
+  resolveZcQuestion(id: string, status: 'answered' | 'expired', answer?: unknown): void {
+    this.db
+      .prepare(
+        `UPDATE zc_questions SET status = ?, answered_at = ?, answer = ? WHERE id = ?`,
+      )
+      .run(status, Date.now(), answer === undefined ? null : JSON.stringify(answer), id);
+  }
+
+  upsertQdSession(row: QdSessionRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO qd_sessions
+          (gateway_session_id, provider_id, qd_session_id, model_public, model_upstream, workspace, one_shot, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(gateway_session_id, provider_id) DO UPDATE SET
+           qd_session_id = excluded.qd_session_id,
+           model_public = excluded.model_public,
+           model_upstream = excluded.model_upstream,
+           workspace = excluded.workspace,
+           one_shot = excluded.one_shot,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        row.gatewaySessionId,
+        row.providerId,
+        row.qdSessionId,
+        row.modelPublic,
+        row.modelUpstream,
+        row.workspace ?? null,
+        row.oneShot ? 1 : 0,
+        row.createdAt,
+        row.updatedAt,
+      );
+  }
+
+  getQdSession(gatewaySessionId: string, providerId: string): QdSessionRow | null {
+    const row = this.db
+      .prepare(`SELECT * FROM qd_sessions WHERE gateway_session_id = ? AND provider_id = ?`)
+      .get(gatewaySessionId, providerId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      gatewaySessionId: String(row.gateway_session_id),
+      providerId: String(row.provider_id),
+      qdSessionId: String(row.qd_session_id),
+      modelPublic: String(row.model_public),
+      modelUpstream: String(row.model_upstream),
+      workspace: nullableStr(row.workspace),
+      oneShot: num(row.one_shot) === 1,
+      createdAt: num(row.created_at),
+      updatedAt: num(row.updated_at),
+    };
+  }
+
+  deleteQdSession(gatewaySessionId: string, providerId: string): void {
+    this.db
+      .prepare(`DELETE FROM qd_sessions WHERE gateway_session_id = ? AND provider_id = ?`)
+      .run(gatewaySessionId, providerId);
+  }
+
+  insertQdLedgerMessages(
+    gatewaySessionId: string,
+    items: Array<{ msgId: string; role: string; text: string }>,
+  ): void {
+    const stmt = this.db.prepare(
+      `INSERT OR IGNORE INTO qd_ledger
+        (gateway_session_id, msg_id, role, text, delivered, created_at)
+       VALUES (?, ?, ?, ?, 0, ?)`,
+    );
+    const now = Date.now();
+    for (const item of items) {
+      stmt.run(gatewaySessionId, item.msgId, item.role, item.text, now);
+    }
+  }
+
+  getUndeliveredQdLedger(gatewaySessionId: string): QdLedgerRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM qd_ledger WHERE gateway_session_id = ? AND delivered = 0 AND role IN ('user', 'system')
+         ORDER BY created_at ASC, rowid ASC`,
+      )
+      .all(gatewaySessionId) as Record<string, unknown>[];
+    return rows.map((row) => ({
+      msgId: String(row.msg_id),
+      role: String(row.role),
+      text: String(row.text),
+      delivered: false,
+      createdAt: num(row.created_at),
+    }));
+  }
+
+  getLastUserQdLedger(gatewaySessionId: string): QdLedgerRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM qd_ledger WHERE gateway_session_id = ? AND role = 'user'
+         ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      )
+      .get(gatewaySessionId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      msgId: String(row.msg_id),
+      role: String(row.role),
+      text: String(row.text),
+      delivered: num(row.delivered) === 1,
+      createdAt: num(row.created_at),
+    };
+  }
+
+  markAllQdLedgerDelivered(gatewaySessionId: string): void {
+    this.db
+      .prepare(
+        `UPDATE qd_ledger SET delivered = 1 WHERE gateway_session_id = ? AND delivered = 0`,
+      )
+      .run(gatewaySessionId);
+  }
+
+  resetQdLedgerDelivered(gatewaySessionId: string): void {
+    this.db
+      .prepare(`UPDATE qd_ledger SET delivered = 0 WHERE gateway_session_id = ?`)
+      .run(gatewaySessionId);
+  }
+
+  appendAssistantQdLedger(gatewaySessionId: string, text: string): void {
+    if (!text) return;
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO qd_ledger
+          (gateway_session_id, msg_id, role, text, delivered, created_at)
+         VALUES (?, ?, 'assistant', ?, 1, ?)`,
+      )
+      .run(
+        gatewaySessionId,
+        `assistant-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        text,
+        Date.now(),
+      );
+  }
+
+  recordQdTask(row: {
+    id: string;
+    gatewaySessionId: string;
+    providerId: string;
+    qdSessionId: string;
+    state: string;
+    createdAt: number;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO qd_tasks
+          (id, gateway_session_id, provider_id, qd_session_id, state, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        row.id,
+        row.gatewaySessionId,
+        row.providerId,
+        row.qdSessionId,
+        row.state,
+        row.createdAt,
+        row.createdAt,
+      );
+  }
+
+  updateQdTask(
+    id: string,
+    state: string,
+    error?: string | null,
+    usage?: unknown,
+  ): void {
+    const finished = state === 'finished' || state === 'failed' || state === 'interrupted';
+    this.db
+      .prepare(
+        `UPDATE qd_tasks SET state = ?, updated_at = ?, finished_at = COALESCE(?, finished_at),
+           error = ?, usage_json = ? WHERE id = ?`,
+      )
+      .run(
+        state,
+        Date.now(),
+        finished ? Date.now() : null,
+        error ?? null,
+        usage === undefined ? null : JSON.stringify(usage),
+        id,
+      );
+  }
+
+  markStaleQdState(): void {
+    const now = Date.now();
+    this.db
+      .prepare(
+        `UPDATE qd_tasks SET state = 'interrupted', updated_at = ?, finished_at = ?
+         WHERE state IN ('running', 'suspended')`,
+      )
+      .run(now, now);
+    this.db
+      .prepare(`UPDATE qd_questions SET status = 'expired' WHERE status = 'pending'`)
+      .run();
+  }
+
+  createQdQuestion(row: {
+    id: string;
+    gatewaySessionId: string;
+    providerId: string;
+    qdSessionId: string;
+    kind: 'form' | 'permission';
+    requestId: string;
+    payload: unknown;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO qd_questions
+          (id, gateway_session_id, provider_id, qd_session_id, kind, request_id, payload, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+      )
+      .run(
+        row.id,
+        row.gatewaySessionId,
+        row.providerId,
+        row.qdSessionId,
+        row.kind,
+        row.requestId,
+        JSON.stringify(row.payload),
+        Date.now(),
+      );
+  }
+
+  resolveQdQuestion(id: string, status: 'answered' | 'expired', answer?: unknown): void {
+    this.db
+      .prepare(
+        `UPDATE qd_questions SET status = ?, answered_at = ?, answer = ? WHERE id = ?`,
+      )
+      .run(status, Date.now(), answer === undefined ? null : JSON.stringify(answer), id);
   }
 
   saveResponseRecord(row: {

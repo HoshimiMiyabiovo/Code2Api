@@ -137,7 +137,17 @@ providers:
     });
     assert.equal(response.status, 400);
     assert.equal(response.body.error.code, 'context_window_exceeded');
+    // 英文标准措辞供 DSH 等客户端识别溢出并自动压缩重试。
+    assert.match(
+      response.body.error.message,
+      /too large for this model's context window/i,
+    );
     assert.equal(fake.models.length, 0);
+
+    // /v1/models 声明容量，供客户端自动压缩做阈值计算。
+    const listing = await fetch(`${harness.base}/v1/models`).then((r) => r.json());
+    const small = listing.data.find((m: any) => m.id === 'small');
+    assert.equal(small.context_length, 120);
   } finally {
     await harness.close();
     await fake.close();

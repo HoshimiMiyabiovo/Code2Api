@@ -6,11 +6,20 @@ export interface ChatContext {
   signal: AbortSignal;
 }
 
+/** 从上游 /models 条目探测到的能力；undefined 表示上游未声明。 */
+export interface DetectedCapabilities {
+  tools?: boolean;
+  vision?: boolean;
+  reasoning?: boolean;
+}
+
 /** 上游 /models 探测结果。 */
 export interface UpstreamModelInfo {
   id: string;
   /** 上游声明的上下文窗口（如有）。 */
   contextWindow?: number;
+  /** 上游声明支持的能力（如 supported_parameters / modalities）。 */
+  capabilities?: DetectedCapabilities;
 }
 
 export interface ProviderAdapter {

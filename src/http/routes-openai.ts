@@ -46,7 +46,10 @@ export function registerOpenAIRoutes(app: FastifyInstance, ctx: GatewayContext):
         id: entry.model.id,
         object: 'model',
         created: 0,
-        owned_by: 'code2api',
+        owned_by: entry.provider.id,
+        // 声明上下文容量：DSH/pi-ai 等客户端据此做自动压缩的阈值计算。
+        ...(entry.model.contextWindow ? { context_length: entry.model.contextWindow } : {}),
+        ...(entry.model.maxOutputTokens ? { max_output_tokens: entry.model.maxOutputTokens } : {}),
       });
     }
     for (const alias of Object.keys(ctx.config.routing.modelAliases)) {
@@ -94,7 +97,8 @@ export function registerOpenAIRoutes(app: FastifyInstance, ctx: GatewayContext):
     try {
       if (!canonical.stream) {
         const outcome = await ctx.router.complete(canonical, controller.signal);
-        const usage = outcome.response.usage;
+        // 记账/计费用上游真实消耗（桥接多 step 累加）；客户端编码仍用 response.usage。
+        const usage = outcome.response.upstreamUsage ?? outcome.response.usage;
         recordRequest(ctx, meta, {
           status: 'ok',
           providerId: outcome.providerId,

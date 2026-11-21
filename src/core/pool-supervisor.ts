@@ -185,7 +185,7 @@ export class PoolSupervisor {
       this.health.set(provider.id, { status: 'healthy', checkedAt: Date.now(), latencyMs: 0 });
       return;
     }
-    if (provider.type === 'opencode') {
+    if (provider.type === 'opencode' || provider.type === 'zcode' || provider.type === 'qoder') {
       const adapter = provider.adapter as {
         workerSnapshot?: () => { state: string; lastError?: string | null };
       };

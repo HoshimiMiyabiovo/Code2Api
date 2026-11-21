@@ -5,6 +5,8 @@ import type { Store } from '../store/db.js';
 import { MockAdapter } from './mock.js';
 import { OpenCodeAdapter } from './opencode.js';
 import { OpenAICompatibleAdapter } from './openai-compatible.js';
+import { QoderAdapter } from './qoder.js';
+import { ZcodeAdapter } from './zcode.js';
 import type { ProviderAdapter } from './types.js';
 
 export interface ProviderRuntime {
@@ -44,6 +46,16 @@ function createAdapter(config: ProviderConfig, store: Store | undefined): Provid
         throw new Error('opencode 渠道需要 Store 支持');
       }
       return new OpenCodeAdapter(config, store);
+    case 'zcode':
+      if (!store) {
+        throw new Error('zcode 渠道需要 Store 支持');
+      }
+      return new ZcodeAdapter(config, store);
+    case 'qoder':
+      if (!store) {
+        throw new Error('qoder 渠道需要 Store 支持');
+      }
+      return new QoderAdapter(config, store);
   }
 }
 
@@ -111,7 +123,8 @@ export class Registry {
 
   /**
    * 将上游目录同步到的模型并入指定渠道。
-   * 已存在时保留手工配置，但会用探测到的上下文窗口回填空缺。
+   * 已存在时保留手工配置：手工填写的上下文窗口/最大输出始终优先；
+   * 留空的字段自动采用上游目录声明值，同一运行周期内多次同步取最大值。
    */
   addUpstreamModel(
     providerId: string,
@@ -124,8 +137,23 @@ export class Registry {
     );
     if (existing) {
       let updated = false;
-      if (model.contextWindow && !existing.contextWindow) {
+      // 手工填写的值是明确的用户意图，始终优先；留空则自动采用目录声明值。
+      const pinnedWindow = existing.source === 'config' ? existing.contextWindow : undefined;
+      if (
+        model.contextWindow &&
+        !pinnedWindow &&
+        model.contextWindow > (existing.contextWindow ?? 0)
+      ) {
         existing.contextWindow = model.contextWindow;
+        updated = true;
+      }
+      const pinnedOutput = existing.source === 'config' ? existing.maxOutputTokens : undefined;
+      if (
+        model.maxOutputTokens &&
+        !pinnedOutput &&
+        model.maxOutputTokens > (existing.maxOutputTokens ?? 0)
+      ) {
+        existing.maxOutputTokens = model.maxOutputTokens;
         updated = true;
       }
       return { added: false, updated };

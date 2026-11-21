@@ -7,6 +7,7 @@ import type { AddressInfo } from 'node:net';
 import type { OpenCodeProviderConfig } from '../config.js';
 import { UpstreamError } from '../errors.js';
 import { log } from '../logger.js';
+import { defaultCodeArtsDataDir, resolveCodeArtsEndpoint } from './codearts-discovery.js';
 
 export interface OpenCodeEvent {
   id?: string;
@@ -14,6 +15,169 @@ export interface OpenCodeEvent {
   created?: number;
   data: Record<string, any>;
 }
+
+const SESSION_ID_KEYS = ['sessionID', 'sessionId', 'session_id'] as const;
+const SESSION_CONTAINER_KEYS = [
+  'data',
+  'properties',
+  'payload',
+  'info',
+  'part',
+  'message',
+  'session',
+  'request',
+  'form',
+  'params',
+] as const;
+
+/** 上游事件里可能出现的敏感键：debug 日志必须脱敏，不能把 IDE 口令/令牌打进日志。 */
+const SENSITIVE_KEY =
+  /^(authorization|password|passwd|secret|token|access[_-]?token|accesstoken|refresh[_-]?token|refreshtoken|api[_-]?key|apikey|cookie|set-cookie)$/i;
+
+function asRecord(value: unknown): Record<string, any> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, any>)
+    : null;
+}
+
+/**
+ * 统一事件负载格式（多方言兼容）：
+ * - 原版 / kilo 的 SSE 是 {type, data}；
+ * - CodeArts IDE 内核（v126.11.1 实测）是 {type, properties}，没有 data；
+ * - 部分 IDE 版本再套一层信封：{directory, payload:{type, properties}}；
+ * - sessionID 可能出现在 data/properties 顶层，也可能嵌在 info/part/message/session 里。
+ * 若不做归一化，dispatch 取不到 sessionID，所有事件都会被静默丢弃，流式请求一直等到客户端超时。
+ */
+export function normalizeEvent(raw: unknown): OpenCodeEvent | null {
+  const initial = asRecord(raw);
+  if (!initial) return null;
+  let node: Record<string, any> = initial;
+  const hasType = (value: Record<string, any>) =>
+    typeof value.type === 'string' || typeof value.event === 'string';
+  // 逐层剥开 {directory, payload: {...}} 信封，最多 3 层，防止异常负载死循环。
+  const ancestors: Record<string, any>[] = [];
+  let depth = 0;
+  while (!hasType(node) && depth < 3) {
+    ancestors.push(node);
+    const next: Record<string, any> | null =
+      asRecord(node.payload) ?? asRecord(node.event);
+    if (!next) return null;
+    node = next;
+    depth += 1;
+  }
+  const type =
+    typeof node.type === 'string'
+      ? node.type
+      : typeof node.event === 'string'
+        ? node.event
+        : '';
+  if (!type) return null;
+
+  const data: Record<string, any> = {};
+  const merge = (value: unknown) => {
+    const rec = asRecord(value);
+    if (rec) Object.assign(data, rec);
+  };
+  // 内层 properties 先铺底，data 后覆盖（与原版 {type,data} 语义一致）。
+  merge(node.properties);
+  const nested = asRecord(node.payload);
+  if (nested) {
+    merge(nested.properties);
+    merge(nested.data);
+    if (
+      !asRecord(nested.properties) &&
+      !asRecord(nested.data) &&
+      !hasType(nested)
+    ) {
+      merge(nested);
+    }
+  }
+  merge(node.data);
+  // 信封/顶层上的 directory、sessionID 也并进 data，供工作区与订阅匹配使用。
+  ancestors.push(node);
+  for (const ancestor of ancestors) {
+    if (typeof ancestor.directory === 'string' && typeof data.directory !== 'string') {
+      data.directory = ancestor.directory;
+    }
+    for (const key of SESSION_ID_KEYS) {
+      if (typeof ancestor[key] === 'string' && typeof data[key] !== 'string') {
+        data[key] = ancestor[key];
+      }
+    }
+  }
+  const id = typeof node.id === 'string' ? node.id : undefined;
+  const created = typeof node.created === 'number' ? node.created : undefined;
+  return { type, data, ...(id ? { id } : {}), ...(created ? { created } : {}) };
+}
+
+/** 从已归一化的事件中提取 sessionID（兼容顶层与常见嵌套容器）。 */
+export function sessionIdOfEvent(event: OpenCodeEvent): string | null {
+  return findSessionId(event.data, 0);
+}
+
+function findSessionId(value: unknown, depth: number): string | null {
+  if (depth > 4) return null;
+  const record = asRecord(value);
+  if (!record) return null;
+  for (const key of SESSION_ID_KEYS) {
+    const candidate = record[key];
+    if (typeof candidate === 'string' && candidate) return candidate;
+  }
+  for (const key of SESSION_CONTAINER_KEYS) {
+    const found = findSessionId(record[key], depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+function redactForLog(value: unknown, depth: number): unknown {
+  if (typeof value === 'string') {
+    return value.length > 240 ? `${value.slice(0, 240)}…(${value.length} chars)` : value;
+  }
+  if (depth > 6) return '…';
+  if (Array.isArray(value)) {
+    const items = value.slice(0, 50).map((item) => redactForLog(item, depth + 1));
+    if (value.length > 50) items.push(`…(${value.length} items)`);
+    return items;
+  }
+  const record = asRecord(value);
+  if (!record) return value;
+  const out: Record<string, unknown> = {};
+  let count = 0;
+  for (const [key, item] of Object.entries(record)) {
+    count += 1;
+    if (count > 80) {
+      out['…'] = 'truncated';
+      break;
+    }
+    out[key] = SENSITIVE_KEY.test(key) ? '***' : redactForLog(item, depth + 1);
+  }
+  return out;
+}
+
+/**
+ * 把 /event 原始帧变成单行、可读、脱敏且限长的 debug 文本。
+ * JSON 解析成功时按结构脱敏；解析失败时退回正则掩码。
+ */
+export function sanitizeEventFrame(raw: string, limit = 1200): string {
+  let text: string;
+  try {
+    text = JSON.stringify(redactForLog(JSON.parse(raw), 0));
+  } catch {
+    text = raw
+      .replace(
+        /("?(?:password|passwd|secret|token|api[_-]?key|authorization|cookie)"?\s*[:=]\s*")([^"]*)(")/gi,
+        '$1***$3',
+      )
+      .replace(/\b(Basic|Bearer)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 ***');
+  }
+  text = text.replace(/\s+/g, ' ').trim();
+  if (text.length > limit) {
+    text = `${text.slice(0, limit)}…(${text.length} chars)`;
+  }
+  return text || '(empty)';
+}
+
 
 export type WorkerState = 'idle' | 'starting' | 'ready' | 'restarting' | 'error' | 'stopped';
 
@@ -83,6 +247,10 @@ export class OpenCodeWorker {
   private eventLoopRunning = false;
   private eventConnected = false;
   private eventWaiters: Array<() => void> = [];
+  /** 当前 /event 连接已收到的数据帧数（每次重连重置）。 */
+  private eventFrames = 0;
+  /** 当前 /event 连接因解析/归一化/订阅原因丢弃的帧数。 */
+  private eventDrops = 0;
   private stopping = false;
   private startPromise: Promise<void> | null = null;
   private readonly subscribers = new Map<string, Set<(event: OpenCodeEvent) => void>>();
@@ -92,7 +260,9 @@ export class OpenCodeWorker {
 
   constructor(private readonly config: OpenCodeProviderConfig) {
     this.passwordEnv = config.passwordEnv;
-    this.externalMode = Boolean(config.baseUrl);
+    // codearts 风味固定外部模式：连接 CodeArts IDE 已拉起的内核服务，
+    // 端口与口令在启动时从 IDE 数据目录发现/解密（IDE 重启后会变化，重新发现）。
+    this.externalMode = Boolean(config.baseUrl) || config.flavor === 'codearts';
     if (config.baseUrl) {
       this.baseUrl = config.baseUrl.replace(/\/+$/, '');
       const password = process.env[this.passwordEnv] ?? '';
@@ -144,6 +314,19 @@ export class OpenCodeWorker {
     if (this.externalMode) {
       this.state = 'starting';
       try {
+        if (this.config.flavor === 'codearts' && !this.config.baseUrl) {
+          const dataDir = this.config.codeartsDataDir ?? defaultCodeArtsDataDir();
+          const endpoint = resolveCodeArtsEndpoint(dataDir);
+          if (!endpoint) {
+            throw new Error(
+              `未发现 CodeArts IDE 内核服务（数据目录 ${dataDir}）；请先打开 CodeArts Agent IDE 并登录`,
+            );
+          }
+          this.baseUrl = endpoint.baseUrl;
+          this.remotePid = endpoint.pid;
+          this.authorization =
+            'Basic ' + Buffer.from(`codearts:${endpoint.password}`).toString('base64');
+        }
         await this.waitReady();
         this.state = 'ready';
         this.startedAt = Date.now();
@@ -183,6 +366,7 @@ export class OpenCodeWorker {
         cwd: workspace,
         env: {
           ...process.env,
+          ...this.config.env,
           OPENCODE_SERVER_PASSWORD: password,
           OPENCODE_SERVER_USERNAME: this.config.username,
         },
@@ -246,12 +430,19 @@ export class OpenCodeWorker {
 
   private async waitReady(): Promise<void> {
     if (!this.baseUrl) throw new Error('baseUrl 未初始化');
+    // kilo（KiloDesktop 内置 opencode fork，v7.8.27 实测）没有 /api/info，
+    // 用 /config 判就绪；pid 仅原版 /api/info 提供，kilo 下 RSS 采样自动跳过。
+    // codearts（IDE 内核，旧版 opencode API）：/config 存在且无 /api 前缀。
+    const probePath =
+      this.config.flavor === 'kilo' || this.config.flavor === 'codearts'
+        ? '/config'
+        : '/api/info';
     const deadline = Date.now() + this.config.startupTimeoutMs;
     let lastMessage = 'no response';
     while (Date.now() < deadline) {
       if (this.stopping) throw new Error('worker stopped');
       try {
-        const info = await this.api<{ pid?: number }>('GET', '/api/info');
+        const info = await this.api<{ pid?: number }>('GET', probePath);
         if (typeof info?.pid === 'number') this.remotePid = info.pid;
         return;
       } catch (error) {
@@ -334,11 +525,21 @@ export class OpenCodeWorker {
     if (!this.baseUrl) {
       throw new UpstreamError('opencode 尚未启动', { category: 'server', retryable: true });
     }
+    // codearts（IDE 内核，旧版 opencode API）：路由无 /api 前缀，统一在此剥掉，
+    // 适配器层保持与原版一致的路径写法。
+    const effectivePath =
+      this.config.flavor === 'codearts' && path.startsWith('/api/')
+        ? path.slice(4)
+        : path;
     let response: Response;
     try {
-      response = await fetch(`${this.baseUrl}${path}`, {
+      response = await fetch(`${this.baseUrl}${effectivePath}`, {
         method,
-        headers: this.headers(body !== undefined),
+        headers: {
+          ...this.headers(body !== undefined),
+          // 旧版服务器对未知路径回退 SPA HTML；显式 Accept 让 API 路由返回 JSON。
+          accept: 'application/json',
+        },
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
         signal,
       });
@@ -373,7 +574,8 @@ export class OpenCodeWorker {
   subscribeSession(
     sessionId: string,
     handler: (event: OpenCodeEvent) => void,
-  ): () => void {    let set = this.subscribers.get(sessionId);
+  ): () => void {
+    let set = this.subscribers.get(sessionId);
     if (!set) {
       set = new Set();
       this.subscribers.set(sessionId, set);
@@ -388,17 +590,7 @@ export class OpenCodeWorker {
   }
 
   private sessionIdOf(event: OpenCodeEvent): string | null {
-    const data = event.data ?? {};
-    const candidates = [
-      data.sessionID,
-      data.form?.sessionID,
-      data.request?.sessionID,
-      data.message?.sessionID,
-    ];
-    for (const value of candidates) {
-      if (typeof value === 'string' && value) return value;
-    }
-    return null;
+    return sessionIdOfEvent(event);
   }
 
   private dispatch(event: OpenCodeEvent): void {
@@ -412,6 +604,16 @@ export class OpenCodeWorker {
       } catch (error) {
         log.warn(`opencode 事件处理出错: ${(error as Error).message}`);
       }
+    }
+  }
+
+  /** 丢弃原因只在 debug 级别打印（/event 是全局流，其他会话的事件无订阅者属正常现象）。 */
+  private noteEventDrop(frame: number, reason: string, raw: string): void {
+    this.eventDrops += 1;
+    if (this.eventDrops <= 50 || this.eventDrops % 50 === 0) {
+      log.debug(
+        `opencode[${this.config.id}] /event 丢弃帧 #${frame}：${reason} | ${sanitizeEventFrame(raw)}`,
+      );
     }
   }
 
@@ -452,7 +654,9 @@ export class OpenCodeWorker {
 
   private async runEventLoop(controller: AbortController): Promise<void> {
     try {
-      const response = await fetch(`${this.baseUrl}/api/event`, {
+      // codearts 旧版 API 事件流无 /api 前缀。
+      const eventPath = this.config.flavor === 'codearts' ? '/event' : '/api/event';
+      const response = await fetch(`${this.baseUrl}${eventPath}`, {
         headers: this.headers(false),
         signal: controller.signal,
       });
@@ -462,6 +666,11 @@ export class OpenCodeWorker {
       this.eventConnected = true;
       const waiters = this.eventWaiters.splice(0);
       for (const waiter of waiters) waiter();
+      this.eventFrames = 0;
+      this.eventDrops = 0;
+      log.debug(
+        `opencode[${this.config.id}] ${eventPath} 已连接：前 ${this.config.eventDebugFrames} 帧以 debug 打印（已脱敏）`,
+      );
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
@@ -476,18 +685,47 @@ export class OpenCodeWorker {
           if (line.startsWith('data:')) {
             const raw = line.slice(5).trim();
             if (raw) {
-              try {
-                const event = JSON.parse(raw) as OpenCodeEvent;
-                if (event && typeof event.type === 'string') this.dispatch(event);
-              } catch {
-                // ignore malformed events
+              this.eventFrames += 1;
+              const frame = this.eventFrames;
+              if (frame <= this.config.eventDebugFrames) {
+                log.debug(
+                  `opencode[${this.config.id}] /event 原始帧 #${frame} ${sanitizeEventFrame(raw)}`,
+                );
               }
+              let parsed: unknown;
+              try {
+                parsed = JSON.parse(raw);
+              } catch {
+                this.noteEventDrop(frame, 'JSON 解析失败', raw);
+                index = buffer.indexOf('\n');
+                continue;
+              }
+              const event = normalizeEvent(parsed);
+              if (!event) {
+                this.noteEventDrop(frame, '未识别事件形态（缺少 type/payload）', raw);
+                index = buffer.indexOf('\n');
+                continue;
+              }
+              const sessionId = this.sessionIdOf(event);
+              if (!sessionId) {
+                this.noteEventDrop(frame, `type=${event.type} 未提取到 sessionID`, raw);
+                index = buffer.indexOf('\n');
+                continue;
+              }
+              if (!this.subscribers.has(sessionId)) {
+                this.noteEventDrop(frame, `sessionID=${sessionId} 无订阅者`, raw);
+                index = buffer.indexOf('\n');
+                continue;
+              }
+              this.dispatch(event);
             }
           }
           index = buffer.indexOf('\n');
         }
       }
-      log.warn(`opencode[${this.config.id}] 事件流结束`);
+      log.warn(
+        `opencode[${this.config.id}] 事件流结束（收到 ${this.eventFrames} 帧，丢弃 ${this.eventDrops} 帧）`,
+      );
     } catch (error) {
       if (!controller.signal.aborted) {
         log.warn(`opencode[${this.config.id}] 事件流中断: ${(error as Error).message}`);

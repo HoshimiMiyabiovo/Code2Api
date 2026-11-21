@@ -77,7 +77,8 @@ export function registerAnthropicRoutes(app: FastifyInstance, ctx: GatewayContex
     try {
       if (!canonical.stream) {
         const outcome = await ctx.router.complete(canonical, controller.signal);
-        const usage = outcome.response.usage;
+        // 记账/计费用上游真实消耗（桥接多 step 累加）；客户端编码仍用 response.usage。
+        const usage = outcome.response.upstreamUsage ?? outcome.response.usage;
         recordRequest(ctx, meta, {
           status: 'ok',
           providerId: outcome.providerId,

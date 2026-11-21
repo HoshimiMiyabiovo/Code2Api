@@ -30,6 +30,15 @@ routing:
     network_ms: 10000      # 网络错误/超时冷却
     empty_stream_ms: 5000  # 上游 200 但无首包
     max_ms: 1800000        # 冷却上限
+  retry:                   # 请求内自动重试（类似 DSH 的 429 回避）
+    enabled: true
+    max_retries: 5         # 最多额外重试轮次（总尝试 = max_attempts + max_retries）
+    initial_delay_ms: 500  # 指数退避起点
+    max_delay_ms: 10000    # 指数退避上限（限流冷却等待不受此上限约束）
+    jitter_ratio: 0.1      # 退避抖动比例 0–1
+    retry_on: [rate_limit, server, timeout, network, empty_stream]
+    respect_retry_after: true  # 优先使用上游 Retry-After / 密钥冷却剩余时间
+    max_total_wait_ms: 120000  # 单请求累计等待上限
 
 anthropic:
   emit_thinking: false     # Anthropic 客户端是否接收 reasoning 块（无签名，默认关闭）
@@ -39,6 +48,7 @@ catalog:
   sync_on_start: true      # 启动时立即同步一次（失败不影响启动）
   sync_interval_ms: 3600000 # 定时同步间隔（默认 1 小时）
   reasoning_hints: true    # 按模型名推断 reasoning 能力（可被手工配置覆盖）
+  strict_capabilities: false # true=上游未声明能力时按不支持拒绝；false=放行（上游报错自动降级）
 
 health:
   enabled: true            # 主动探活（HTTP 渠道探测 /models）
@@ -128,6 +138,9 @@ providers:
   #   memory_budget_mb: 2048                 # 本地 worker 总内存预算（0=不限）
   #   question_timeout_ms: 600000            # 面板提问等待超时
   #   task_timeout_ms: 1800000               # 单任务超时
+  #   first_byte_timeout_ms: 120000          # 首包等待预算（毫秒）；超时中断并明确报错，0=关闭
+  #   stream_heartbeat_ms: 10000             # 上游静默时的 SSE 心跳（毫秒），防客户端空闲超时，0=关闭
+  #   event_debug_frames: 20                 # /event 前 N 帧原始日志（已脱敏；需 CODE2API_LOG_LEVEL=debug）
   #   startup_timeout_ms: 60000
   #   restart_budget: 3
   #   # base_url: http://127.0.0.1:4096     # 连接已有 serve 时填写；口令取自 password_env
@@ -142,3 +155,91 @@ providers:
   #   #       tools: true
   #   #       vision: false
   #   #       reasoning: true
+
+  # KiloDesktop 渠道示例（内置 kilo.exe 是 opencode fork，v7.8.27 实测；凭据复用桌面端登录态）
+  # - id: kilo
+  #   type: opencode
+  #   flavor: kilo                            # 就绪探针用 /config（kilo 无 /api/info）；模型条目无 type 字段，按 enabled/status 过滤
+  #   priority: 25
+  #   command: C:/Users/<用户名>/AppData/Local/KiloDesktop/app-1.0.0/resources/kilo/windows-x64-baseline/bin/kilo.exe
+  #   # 注意：路径含版本号，KiloDesktop 自动升级后需在面板更新 command
+  #   workspace: ./workspace-kilo
+  #   workspace_roots:
+  #     - E:/GithubProject
+  #   agent: build
+  #   permission_mode: ask
+  #   auto_models: true                       # /api/model 返回 Kilo Gateway 全量目录（providerID=kilo）
+  #   model_filter:                           # 自动发现白名单（glob，匹配 modelID）；手工 models 不受影响
+  #     - "*:free"                            # 只接免费模型
+  #   models: []
+  #   # models:
+  #   #   - id: kilo-gemini
+  #   #     upstream: kilo/google/gemini-4-neon  # providerID/modelID；modelID 自身可含斜杠
+
+  # ZCode CLI 渠道示例（本机 ZCode CLI app-server）
+  # 独立 CLI 需要自己的登录态：先在隔离环境完成一次 zcode login（见 AGENTS.md 第 4 节），
+  # env 三件套（数据目录 / 文件密钥 / 内置 provider 目录）必须与登录时一致。
+  # - id: zcode
+  #   type: zcode
+  #   priority: 30
+  #   command: node                           # 可执行文件
+  #   args:                                   # CLI 入口（网关会自动追加 app-server）
+  #     - F:/Program Files/zcode/resources/glm/zcode.cjs
+  #   env:                                    # 注入 CLI 子进程的环境变量
+  #     ZCODE_DATA_BASE_DIR: E:/GithubProject/Code2Api/data/zcode-cli                             # 独立 CLI 数据目录（与桌面端隔离）
+  #     ZCODE_CREDENTIAL_SECRET_FILE: E:/GithubProject/Code2Api/data/zcode-cli/credential-secret  # 文件密钥（32-4096 字节；独立 CLI 的 keyring 在此打包下缺失，必须走文件密钥）
+  #     ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: F:/Program Files/zcode/resources/config/provider/zcode-builtin.json
+  #   workspace: ./workspace                  # CLI 工作目录（自动创建）
+  #   workspace_roots:                        # 允许请求头 x-code2api-workspace 指定的工作区根目录
+  #     - E:/GithubProject
+  #   mode: build                             # plan | build | edit | yolo | guarded（yolo 不产生面板审批）
+  #   max_workers: 1
+  #   max_concurrent_sessions: 2
+  #   idle_ttl_ms: 900000
+  #   question_timeout_ms: 600000
+  #   task_timeout_ms: 1800000
+  #   startup_timeout_ms: 60000
+  #   restart_budget: 3
+  #   models:                                 # 无自动发现，必须手工配置；upstream 为 providerId/modelId
+  #     - id: glm-5.3-flash
+  #       upstream: account:zai-individual-coding-plan/GLM-5.3-Flash   # 账号 provider，login 后可用
+  #       context_window: 1000000
+  #       max_output_tokens: 128000
+  #       capabilities:
+  #         tools: true
+  #         vision: true
+  #         reasoning: true
+
+  # Qoder CLI 渠道示例（qoder daemon --sdk；协议见 AGENTS.md 第 4 节）
+  # 默认复用 IDE 内嵌执行端（Qoder.exe 以 ELECTRON_RUN_AS_NODE 跑自带 worker runtime）；
+  # 路径占位符请替换为本机实际安装路径。凭据需真实冒烟校准：IDE 登录态能否直接复用未知，
+  # 不可用时在 env 里注入 QODER_PERSONAL_ACCESS_TOKEN（国内版变量前缀为 QODERCN_）。
+  # - id: qoder
+  #   type: qoder
+  #   priority: 40
+  #   command: <Qoder 安装目录>/Qoder.exe       # 如 E:/Program Files/Qoder/.qoder-versions/0.5.17/Qoder.exe
+  #   args:                                     # worker runtime 入口（网关会自动追加 --sdk）
+  #     - <Qoder 安装目录>/resources/app.asar.unpacked/node_modules/@qoder-ai/qoder-agent-sdk/dist/_worker/qoder-worker-runtime.obf.mjs
+  #   env:                                      # 注入 CLI 子进程的环境变量
+  #     ELECTRON_RUN_AS_NODE: "1"               # Qoder.exe 以 node 身份运行（IDE 同款拉起方式）
+  #     # QODER_PERSONAL_ACCESS_TOKEN: <token>  # IDE 登录态不可复用时的兜底
+  #   workspace: ./workspace
+  #   workspace_roots:
+  #     - E:/GithubProject
+  #   mode: auto                                # default | accept_edits | dont_ask | plan | bypass_permissions | auto
+  #   max_workers: 1
+  #   max_concurrent_sessions: 2
+  #   idle_ttl_ms: 900000
+  #   question_timeout_ms: 600000
+  #   task_timeout_ms: 1800000
+  #   startup_timeout_ms: 90000
+  #   restart_budget: 3
+  #   models:                                   # 无自动发现，必须手工配置；upstream 为 providerId/modelId（真实取值需冒烟校准）
+  #     - id: qoder-fake-model
+  #       upstream: fake-qoder-provider/fake-model
+  #       context_window: 200000
+  #       max_output_tokens: 32000
+  #       capabilities:
+  #         tools: true
+  #         vision: true
+  #         reasoning: true

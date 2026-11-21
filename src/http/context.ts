@@ -18,4 +18,5 @@ export interface GatewayContext {
   adminToken: string;
   configPath?: string;
   applyConfig: (config: ResolvedConfig) => Promise<void>;
+  applyRetryConfig: (config: ResolvedConfig) => void;
 }

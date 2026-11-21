@@ -39,6 +39,8 @@ export async function createGateway(
   const adminToken = config.admin.token || randomBytes(18).toString('base64url');
   const store = new Store(config.storage.path);
   store.markStaleOcState();
+  store.markStaleZcState();
+  store.markStaleQdState();
   const recordAttemptFailure = (info: {
     providerId: string;
     keyLabel: string;
@@ -70,6 +72,7 @@ export async function createGateway(
     registry,
     config.routing.maxAttempts,
     config.routing.cooldowns,
+    config.routing.retry,
     recordAttemptFailure,
     config.routing.modelAliases,
     config.routing.modelBlacklist,
@@ -95,6 +98,7 @@ export async function createGateway(
         nextRegistry,
         next.routing.maxAttempts,
         next.routing.cooldowns,
+        next.routing.retry,
         recordAttemptFailure,
         next.routing.modelAliases,
         next.routing.modelBlacklist,
@@ -110,6 +114,20 @@ export async function createGateway(
       void supervisor.probeHealthAll();
       await previous.close();
       log.info(`配置已热加载，当前渠道: ${nextRegistry.providers.map((p) => p.id).join(', ')}`);
+    },
+    applyRetryConfig: (next: ResolvedConfig) => {
+      ctx.config = next;
+      ctx.router = new Router(
+        ctx.registry,
+        next.routing.maxAttempts,
+        next.routing.cooldowns,
+        next.routing.retry,
+        recordAttemptFailure,
+        next.routing.modelAliases,
+        next.routing.modelBlacklist,
+        supervisor,
+      );
+      log.info('重试配置已热加载');
     },
   };
 
