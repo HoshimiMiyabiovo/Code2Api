@@ -1,6 +1,7 @@
 import type { CatalogConfig, ModelConfig } from '../config.js';
 import { log } from '../logger.js';
 import type { Registry } from '../providers/registry.js';
+import { matchesGlob } from './model-rules.js';
 
 export interface CatalogSyncReport {
   providerId: string;
@@ -41,7 +42,27 @@ export function guessReasoningModel(id: string): boolean {
   return REASONING_NAME_PATTERNS.some((pattern) => pattern.test(id));
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+/**
+ * 匹配渠道 model_prefixes 规则（glob → 前缀），决定自动发现模型的对外名前缀。
+ * 与 model_filter 同语义：模式同时匹配裸 modelID 与 providerID/modelID（upstream），
+ * 命中多条时取先配置的；返回 undefined 表示不加前缀。
+ */
+export function matchModelPrefix(
+  prefixes: Record<string, string> | undefined,
+  modelId: string,
+  upstream?: string,
+): string | undefined {
+  if (!prefixes) return undefined;
+  for (const [pattern, prefix] of Object.entries(prefixes)) {
+    if (matchesGlob(modelId, pattern) || (upstream !== undefined && matchesGlob(upstream, pattern))) {
+      return prefix;
+    }
+  }
+  return undefined;
+}
+
+/** 给探测/同步类调用加总超时；导出供 admin 探测端点复用。 */
+export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${label} 超时（${ms}ms）`)), ms);
     timer.unref?.();
@@ -128,12 +149,15 @@ export class ModelCatalog {
             );
             let providerAdded = 0;
             for (const info of infos) {
+              // 渠道 model_prefixes：按 upstream 给对外名加前缀（如 opencode-go/* → Go/）。
+              const prefix = matchModelPrefix(providerConfig.modelPrefixes, info.id, info.upstream);
+              const syncedId = prefix ? `${prefix}${info.id}` : info.id;
               const conflict = registry
-                .candidates(info.id)
+                .candidates(syncedId)
                 .some((entry) => entry.provider.id !== provider.id);
               const model: ModelConfig = {
                 ...info,
-                id: conflict ? `${provider.id}/${info.id}` : info.id,
+                id: conflict ? `${provider.id}/${syncedId}` : syncedId,
                 source: 'upstream',
               };
               if (registry.addUpstreamModel(provider.id, model).added) providerAdded += 1;
@@ -197,8 +221,9 @@ export class ModelCatalog {
                 ? config.reasoningHints && guessReasoningModel(info.id)
                 : true;
             }
+            const prefix = matchModelPrefix(providerConfig.modelPrefixes, info.id, info.id);
             const model: ModelConfig = {
-              id: info.id,
+              id: prefix ? `${prefix}${info.id}` : info.id,
               upstream: info.id,
               contextWindow: info.contextWindow,
               capabilities: {

@@ -55,6 +55,16 @@ health:
   interval_ms: 300000      # 探活间隔
   timeout_ms: 10000        # 单次探活超时
 
+privacy:                   # 隐私守卫：出站令牌化 / 审计，入站还原（面板可改，热加载）
+  mode: off                # off=不检测 | audit=只检测记录不替换 | token=替换+还原（推荐先 audit 观察再切 token）
+  identity: false          # 身份类检测（用户名/uid/邮箱/用户目录路径），误报风险高于凭据类
+  protect_config_secrets: true  # 精确匹配本配置里的密钥/口令（零误报）
+  providers:
+    include: []            # 空=全部直连渠道；桥接渠道(opencode/zcode/qoder)需显式列入才生效
+    exclude: []            # 排除的渠道 id
+  token_retention_days: 30 # 保管库条目保留天数（按最后使用）
+  max_vault_entries: 5000  # 保管库容量上限（LRU 修剪）
+
 providers:
   # 内置 mock 渠道：无需密钥，用于首跑自测；正式使用可置 enabled: false
   - id: mock
@@ -81,6 +91,9 @@ providers:
   #   token_limit_field: max_tokens          # max_tokens | max_completion_tokens
   #   send_stream_options: true              # 上游支持 stream_options.include_usage
   #   sync_models: true                      # 从上游 /models 同步模型目录（默认 true）
+  #   user_agent: code2api/0.1.0             # 上游 User-Agent（默认 code2api/<version>）
+  #   models_url: https://api.example.com/v1/models  # 模型目录地址（chat 与目录路径不同时填）
+  #   session_header: x-opencode-session     # 按会话注入稳定 ID 的请求头（OpenCode Go 必需）
   #   default_reasoning_effort: medium       # reasoning 模型默认推理强度（客户端未指定时注入，支持 xhigh/max 等）
   #   reasoning_budget_field: reasoning.max_tokens  # Anthropic thinking.budget_tokens 透传字段（点号路径）
   #   quota:                                 # 可选：额度探针（按返回 JSON 路径解析）
@@ -121,6 +134,25 @@ providers:
   #         output_per_mtok: 0.6
   #         cache_read_per_mtok: 0.075
 
+  # OpenCode Go 订阅渠道示例（Go 要求每个请求带稳定会话 ID）
+  # - id: opencode-go
+  #   type: openai-compatible
+  #   priority: 5
+  #   base_url: https://opencode.ai/inference/go/openai/v1
+  #   models_url: https://opencode.ai/inference/go/v1/models
+  #   session_header: x-opencode-session      # 网关自动生成/透传，客户端无需配置
+  #   user_agent: code2api/0.1.0              # 必须是客户端自己的标识，不能是通用 SDK 名
+  #   keys:
+  #     - label: main
+  #       key_env: OPENCODE_GO_API_KEY
+  #   model_prefixes:                        # 自动发现模型的对外名前缀（glob → 前缀，匹配 modelID 或 providerID/modelID）
+  #     "deepseek*": "Go/"                   # 如目录模型 deepseek-v4.1-flash 同步为 Go/deepseek-v4.1-flash；upstream 不变
+  #   models:
+  #     - id: deepseek-v4.1-flash
+  #       capabilities:
+  #         tools: true
+  #         reasoning: true
+
   # CLI / 订阅型渠道示例（本机 opencode serve）
   # - id: opencode
   #   type: opencode
@@ -132,6 +164,11 @@ providers:
   #   agent: build
   #   permission_mode: ask                   # ask | allow | deny
   #   auto_models: true                      # 自动从 /api/model 发现模型，models 可留空
+  #   model_filter:                          # 自动发现白名单（glob，匹配 modelID 与 providerID/modelID）
+  #     - "*free*"
+  #     - "opencode-go/*"
+  #   model_prefixes:                        # 自动发现模型的对外名前缀（glob → 前缀）；手工 models 与 upstream 不受影响
+  #     "opencode-go/*": "Go/"               # 如 opencode-go/claude-x 同步为 Go/claude-x
   #   max_workers: 2                         # 本地进程池上限（外部服务模式固定 1）
   #   max_concurrent_sessions: 4             # 每个 worker 的并发会话数
   #   idle_ttl_ms: 900000                    # 空闲 worker 回收时间

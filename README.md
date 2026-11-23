@@ -77,6 +77,29 @@ start.cmd
 
 面向转发站/中转 API：配置 `base_url`、密钥池、超时、认证头（`Authorization: Bearer` 或 `x-api-key`）、是否发送 `stream_options.include_usage` 等。支持从上游 `/models` 自动同步模型。
 
+可选的会话/标识字段：
+
+- `models_url`：模型目录与 chat 路径不同的上游（例如 OpenCode Go 的 chat 在 `/openai/v1`、目录在 `/v1/models`）。
+- `user_agent`：改写上游 User-Agent（默认 `code2api/<version>`）。
+- `session_header`：按会话注入稳定 ID（如 `x-opencode-session`）。优先取客户端 `x-code2api-session` 或 `x-opencode-session`；客户端没给时按首条用户消息指纹生成，跨轮稳定，避免每轮换 ID 导致上游 prompt cache 失效。Responses 的一次性 `resp_*` 不会被当成会话 ID。
+- 思考回放：OpenAI Chat 输入里 assistant 的 `reasoning_content` 会保留并转发给上游（DeepSeek 思考模式的多轮请求需要）；上游 400 拒绝时自动剥离并重试。
+
+OpenCode Go 示例：
+
+```yaml
+- id: opencode-go
+  type: openai-compatible
+  base_url: https://opencode.ai/inference/go/openai/v1
+  models_url: https://opencode.ai/inference/go/v1/models
+  session_header: x-opencode-session
+  user_agent: code2api/0.1.0
+  keys:
+    - label: main
+      key_env: OPENCODE_GO_API_KEY
+  models:
+    - id: deepseek-v4.1-flash
+```
+
 ### opencode（任务级）
 
 面向本机 opencode CLI：
@@ -89,7 +112,7 @@ start.cmd
 
 ## 模型目录
 
-- openai-compatible：同步上游 `GET /models`。
+- openai-compatible：同步上游 `GET /models`（配置了 `models_url` 时走该地址）。
 - opencode：同步 `/api/model`，读取 `limit.context` / `limit.output`，并对已有模型回填上下文窗口。
 - 手工配置的 `models` 优先，不会被同步结果覆盖。
 - opencode `/api/model` 中缺 `type`、`name === modelID`、`cost` 为空的条目属于旧配置残影，会自动过滤（实际请求会返回 `Model is unavailable`）。

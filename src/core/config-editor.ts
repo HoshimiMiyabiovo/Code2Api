@@ -1,6 +1,7 @@
 import { copyFileSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import YAML from 'yaml';
-import { z } from 'zod';import {
+import { z } from 'zod';
+import {
   RETRY_CATEGORIES,
   parseConfig,
   type KeyConfig,
@@ -13,6 +14,7 @@ import { z } from 'zod';import {
   type ZcodeProviderConfig,
 } from '../config.js';
 import { GatewayError } from '../errors.js';
+import { encryptSecret, isSecretEncryptionAvailable } from './secrets.js';
 
 const DEFAULT_TIMEOUTS: Timeouts = {
   connectMs: 30000,
@@ -87,6 +89,27 @@ const channelInputSchema = z.object({
   tokenLimitField: z.enum(['max_tokens', 'max_completion_tokens']).default('max_tokens'),
   sendStreamOptions: z.boolean().default(true),
   syncModels: z.boolean().default(true),
+  modelsUrl: z
+    .string()
+    .trim()
+    .max(2048)
+    .optional()
+    .refine(
+      (value) => !value || /^https?:\/\/\S+$/.test(value),
+      'models_url 必须是 http(s) 完整 URL',
+    ),
+  userAgent: z
+    .string()
+    .trim()
+    .max(256)
+    .regex(/^[\x20-\x7e]*$/, 'User-Agent 仅支持可见 ASCII')
+    .optional(),
+  sessionHeader: z
+    .string()
+    .trim()
+    .max(64)
+    .regex(/^[A-Za-z0-9-]*$/, '会话头名称仅支持字母、数字和连字符')
+    .optional(),
   defaultReasoningEffort: z.string().trim().min(1).max(32).optional(),
   reasoningBudgetField: z.string().trim().min(1).max(128).optional(),
   command: z.string().trim().min(1).max(1024).optional(),
@@ -101,6 +124,23 @@ const channelInputSchema = z.object({
   flavor: z.enum(['opencode', 'kilo', 'codearts']).optional(),
   codeartsDataDir: z.string().trim().min(1).max(1024).optional(),
   modelFilter: z.array(z.string().trim().min(1).max(256)).max(64).optional(),
+  modelPrefixes: z
+    .record(z.string())
+    .optional()
+    .refine(
+      (value) =>
+        !value ||
+        Object.entries(value).every(
+          ([pattern, prefix]) =>
+            pattern.trim().length > 0 &&
+            pattern.length <= 128 &&
+            !/\s/.test(pattern) &&
+            prefix.trim().length > 0 &&
+            prefix.length <= 64 &&
+            !/\s/.test(prefix),
+        ),
+      'model_prefixes 需为 glob → 前缀 的映射，键值均不能含空白',
+    ),
   mode: z
     .union([
       z.enum(['plan', 'build', 'edit', 'yolo', 'guarded']),
@@ -134,8 +174,21 @@ const retryInputSchema = z.object({
   maxTotalWaitMs: z.number().int().min(1).max(3600000),
 });
 
+const privacyInputSchema = z.object({
+  mode: z.enum(['off', 'audit', 'token']),
+  identity: z.boolean(),
+  protectConfigSecrets: z.boolean(),
+  providers: z.object({
+    include: z.array(z.string().trim().min(1).max(64)).max(64),
+    exclude: z.array(z.string().trim().min(1).max(64)).max(64),
+  }),
+  tokenRetentionDays: z.number().int().min(1).max(3650),
+  maxVaultEntries: z.number().int().min(10).max(100000),
+});
+
 export type ChannelInput = z.infer<typeof channelInputSchema>;
 export type RetryInput = z.infer<typeof retryInputSchema>;
+export type PrivacyInput = z.infer<typeof privacyInputSchema>;
 type KeyInput = z.infer<typeof keyInputSchema>;
 type ModelInput = z.infer<typeof modelInputSchema>;
 
@@ -185,6 +238,17 @@ export function parseRetryInput(raw: unknown): RetryInput {
   return result.data;
 }
 
+export function parsePrivacyInput(raw: unknown): PrivacyInput {
+  const result = privacyInputSchema.safeParse(raw);
+  if (!result.success) {
+    const details = result.error.issues
+      .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+      .join('；');
+    bad(`隐私守卫配置校验失败：${details}`);
+  }
+  return result.data;
+}
+
 function modelToConfig(model: ModelInput): ModelConfig {
   const pricing = model.pricing;
   const hasPricing =
@@ -228,6 +292,19 @@ function mergeKeys(
   const usedLabels = new Set<string>();
   const result: KeyConfig[] = [];
 
+  const encryptValue = (label: string, plain: string): string => {
+    if (!isSecretEncryptionAvailable()) {
+      bad(
+        `无法加密保存密钥 ${label}：当前环境未启用密钥加密，请改用环境变量（key_env）`,
+      );
+    }
+    try {
+      return encryptSecret(plain);
+    } catch (error) {
+      bad(`加密保存密钥 ${label} 失败：${(error as Error).message}`);
+    }
+  };
+
   for (const spec of specs) {
     if (usedLabels.has(spec.label)) {
       bad(`密钥 label 重复：${spec.label}`);
@@ -237,7 +314,15 @@ function mergeKeys(
     switch (spec.action) {
       case 'keep':
         if (!current) bad(`密钥 ${spec.label} 不存在，无法保留`);
-        result.push({ ...current });
+        // 历史明文 key 在任意一次保存时顺带迁移为密文，避免继续落盘。
+        if (!current.keyEnv && !current.keyEnc && current.key) {
+          result.push({
+            ...current,
+            keyEnc: encryptValue(spec.label, current.key),
+          });
+        } else {
+          result.push({ ...current });
+        }
         break;
       case 'remove':
         if (!current) bad(`密钥 ${spec.label} 不存在，无法删除`);
@@ -248,7 +333,11 @@ function mergeKeys(
         break;
       case 'set_key':
         if (!current) bad(`密钥 ${spec.label} 不存在，无法修改`);
-        result.push({ label: spec.label, key: spec.key });
+        result.push({
+          label: spec.label,
+          key: spec.key,
+          keyEnc: encryptValue(spec.label, spec.key),
+        });
         break;
       case 'new':
         if (creating === false && current) {
@@ -259,7 +348,11 @@ function mergeKeys(
           result.push(resolveEnvKey(spec.label, spec.keyEnv));
         } else {
           if (!spec.key) bad(`新密钥 ${spec.label} 缺少密钥值`);
-          result.push({ label: spec.label, key: spec.key });
+          result.push({
+            label: spec.label,
+            key: spec.key,
+            keyEnc: encryptValue(spec.label, spec.key),
+          });
         }
         break;
     }
@@ -273,7 +366,11 @@ function mergeKeys(
   return result;
 }
 
-function buildProvider(input: ChannelInput, existing?: ProviderConfig): ProviderConfig {
+/**
+ * 把渠道草稿解析为完整的 ProviderConfig（供保存与探测共用）。
+ * existing 传入当前已保存的同 id 渠道时按 update 语义合并字段与密钥。
+ */
+export function buildProvider(input: ChannelInput, existing?: ProviderConfig): ProviderConfig {
   if (existing && existing.type !== input.type) {
     bad('不支持修改渠道类型');
   }
@@ -286,9 +383,6 @@ function buildProvider(input: ChannelInput, existing?: ProviderConfig): Provider
     modelIds.add(model.id);
     return modelToConfig(model);
   });
-  if (models.length === 0 && !(input.type === 'opencode' && input.autoModels)) {
-    bad('至少配置一个模型（opencode 可开启自动发现）');
-  }
   const base = {
     id: input.id,
     priority: input.priority,
@@ -313,6 +407,7 @@ function buildProvider(input: ChannelInput, existing?: ProviderConfig): Provider
       flavor: input.flavor ?? existingOc?.flavor ?? 'opencode',
       codeartsDataDir: input.codeartsDataDir ?? existingOc?.codeartsDataDir,
       modelFilter: input.modelFilter ?? existingOc?.modelFilter ?? [],
+      modelPrefixes: input.modelPrefixes ?? existingOc?.modelPrefixes,
       command: input.command ?? existingOc?.command ?? 'opencode',
       args: existingOc?.args ?? [],
       env: existingOc?.env ?? {},
@@ -409,11 +504,8 @@ function buildProvider(input: ChannelInput, existing?: ProviderConfig): Provider
     };
   }
   if (!input.baseUrl) bad('openai-compatible 渠道需要填写 base_url');
-  const keys = mergeKeys(
-    existing?.type === 'openai-compatible' ? existing.keys : [],
-    input.keys,
-    !existing,
-  );
+  const existingOa = existing?.type === 'openai-compatible' ? existing : null;
+  const keys = mergeKeys(existingOa?.keys ?? [], input.keys, !existing);
   return {
     ...base,
     type: 'openai-compatible',
@@ -421,15 +513,22 @@ function buildProvider(input: ChannelInput, existing?: ProviderConfig): Provider
     authHeader: input.authHeader,
     tokenLimitField: input.tokenLimitField,
     sendStreamOptions: input.sendStreamOptions,
-    extraHeaders: existing?.type === 'openai-compatible' ? existing.extraHeaders : {},
-    timeouts: existing?.type === 'openai-compatible' ? existing.timeouts : DEFAULT_TIMEOUTS,
-    syncModels: existing?.type === 'openai-compatible' ? existing.syncModels : true,
-    defaultReasoningEffort:
-      existing?.type === 'openai-compatible' ? existing.defaultReasoningEffort : undefined,
-    reasoningBudgetField:
-      existing?.type === 'openai-compatible' ? existing.reasoningBudgetField : undefined,
-    quota: existing?.type === 'openai-compatible' ? existing.quota : undefined,
-    keepalive: existing?.type === 'openai-compatible' ? existing.keepalive : undefined,
+    extraHeaders: existingOa?.extraHeaders ?? {},
+    userAgent:
+      input.userAgent !== undefined ? input.userAgent || undefined : existingOa?.userAgent,
+    modelsUrl:
+      input.modelsUrl !== undefined ? input.modelsUrl || undefined : existingOa?.modelsUrl,
+    sessionHeader:
+      input.sessionHeader !== undefined
+        ? input.sessionHeader || undefined
+        : existingOa?.sessionHeader,
+    modelPrefixes: input.modelPrefixes ?? existingOa?.modelPrefixes,
+    timeouts: existingOa?.timeouts ?? DEFAULT_TIMEOUTS,
+    syncModels: existingOa?.syncModels ?? true,
+    defaultReasoningEffort: existingOa?.defaultReasoningEffort,
+    reasoningBudgetField: existingOa?.reasoningBudgetField,
+    quota: existingOa?.quota,
+    keepalive: existingOa?.keepalive,
     keys,
   };
 }
@@ -477,6 +576,12 @@ function providerToRaw(provider: ProviderConfig): Record<string, unknown> {
     raw.token_limit_field = provider.tokenLimitField;
     raw.send_stream_options = provider.sendStreamOptions;
     raw.sync_models = provider.syncModels;
+    if (provider.userAgent) raw.user_agent = provider.userAgent;
+    if (provider.modelsUrl) raw.models_url = provider.modelsUrl;
+    if (provider.sessionHeader) raw.session_header = provider.sessionHeader;
+    if (provider.modelPrefixes && Object.keys(provider.modelPrefixes).length > 0) {
+      raw.model_prefixes = provider.modelPrefixes;
+    }
     if (provider.defaultReasoningEffort) {
       raw.default_reasoning_effort = provider.defaultReasoningEffort;
     }
@@ -522,14 +627,20 @@ function providerToRaw(provider: ProviderConfig): Record<string, unknown> {
       total_ms: provider.timeouts.totalMs,
     };
     raw.keys = provider.keys.map((key) => {
+      if (key.keyEnc) return { label: key.label, key_enc: key.keyEnc };
       if (key.keyEnv) return { label: key.label, key_env: key.keyEnv };
       if (key.key) return { label: key.label, key: key.key };
-      throw new Error(`渠道 ${provider.id} 密钥 ${key.label} 既无 key 也无 key_env`);
+      throw new Error(
+        `渠道 ${provider.id} 密钥 ${key.label} 既无 key_enc、key_env，也无明文 key`,
+      );
     });
   } else if (provider.type === 'opencode') {
     if (provider.flavor !== 'opencode') raw.flavor = provider.flavor;
     if (provider.codeartsDataDir) raw.codearts_data_dir = provider.codeartsDataDir;
     if (provider.modelFilter.length > 0) raw.model_filter = provider.modelFilter;
+    if (provider.modelPrefixes && Object.keys(provider.modelPrefixes).length > 0) {
+      raw.model_prefixes = provider.modelPrefixes;
+    }
     raw.command = provider.command;
     if (provider.args.length > 0) raw.args = provider.args;
     raw.workspace = provider.workspace;
@@ -594,6 +705,11 @@ function collectWarnings(config: ResolvedConfig): string[] {
       if (key.missingEnv) {
         warnings.push(
           `渠道 ${provider.id} 密钥 ${key.label} 缺少环境变量 ${key.missingEnv}，暂时不可用`,
+        );
+      }
+      if (key.keyError) {
+        warnings.push(
+          `渠道 ${provider.id} 密钥 ${key.label} 解密失败（${key.keyError}），暂时不可用`,
         );
       }
     }
@@ -703,6 +819,9 @@ export function upsertChannel(
     if (mode === 'update' && !existing) {
       bad(`渠道 ${input.id} 不存在`, 404, 'not_found');
     }
+    if (input.models.length === 0 && !(input.type === 'opencode' && input.autoModels)) {
+      bad('至少配置一个模型（opencode 可开启自动发现）');
+    }
     const provider = buildProvider(input, existing);
     const providers =
       mode === 'create'
@@ -758,6 +877,35 @@ export function updateRetryPolicy(
       bad((error as Error).message, 400, 'config_invalid');
     }
     doc.setIn(['routing', 'retry'], retryRaw);
+    const nextConfig = writeConfigDocument(configPath, doc);
+    return { config: nextConfig, warnings: collectWarnings(nextConfig) };
+  });
+}
+
+export function updatePrivacyPolicy(
+  configPath: string,
+  input: PrivacyInput,
+): Promise<SaveChannelResult> {
+  return exclusive(() => {
+    const { doc } = readConfigDocument(configPath);
+    const privacyRaw = {
+      mode: input.mode,
+      identity: input.identity,
+      protect_config_secrets: input.protectConfigSecrets,
+      providers: {
+        include: input.providers.include,
+        exclude: input.providers.exclude,
+      },
+      token_retention_days: input.tokenRetentionDays,
+      max_vault_entries: input.maxVaultEntries,
+    };
+    const baseRaw = doc.toJS() as Record<string, unknown>;
+    try {
+      parseConfig({ ...baseRaw, privacy: privacyRaw });
+    } catch (error) {
+      bad((error as Error).message, 400, 'config_invalid');
+    }
+    doc.set('privacy', privacyRaw);
     const nextConfig = writeConfigDocument(configPath, doc);
     return { config: nextConfig, warnings: collectWarnings(nextConfig) };
   });

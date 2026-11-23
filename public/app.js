@@ -8,14 +8,19 @@
     loading: false,
     channels: [],
     channelsEditable: false,
+    secretStorage: { available: false, backend: '' },
     editingChannelId: null,
     editingModels: [],
     selectedModelIndex: 0,
+    probedModels: [],
+    probeBusy: false,
     models: [],
     modelFilter: '',
     collapsedModelGroups: new Set(),
     retryDirty: false,
     retryEditable: false,
+    privacyDirty: false,
+    privacyEditable: false,
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -42,6 +47,12 @@
   const modelPicker = $('#model-picker');
   const modelCount = $('#model-count');
   const modelRemoveBtn = $('#model-remove-btn');
+  const probeModelsBtn = $('#probe-models-btn');
+  const probeStatus = $('#probe-status');
+  const probeResults = $('#probe-results');
+  const upstreamOptions = $('#upstream-options');
+  const modelPrefixesRow = $('#ch-model-prefixes-row');
+  const modelPrefixesInput = $('#ch-model-prefixes');
   const questionsPanel = $('#questions-panel');
   const questionsList = $('#questions-list');
   const retryNote = $('#retry-note');
@@ -54,6 +65,19 @@
   const retryJitter = $('#retry-jitter');
   const retryTotal = $('#retry-total');
   const retryCategoriesEl = $('#retry-categories');
+  const privacyNote = $('#privacy-note');
+  const privacySaveBtn = $('#privacy-save');
+  const privacyMode = $('#privacy-mode');
+  const privacyIdentity = $('#privacy-identity');
+  const privacyConfigSecrets = $('#privacy-config-secrets');
+  const privacyInclude = $('#privacy-include');
+  const privacyExclude = $('#privacy-exclude');
+  const privacyRetention = $('#privacy-retention');
+  const privacyMaxVault = $('#privacy-max-vault');
+  const privacyStatus = $('#privacy-status');
+  const privacyEventsBody = $('#privacy-events-body');
+  const privacyVaultBody = $('#privacy-vault-body');
+  const privacyVaultNote = $('#privacy-vault-note');
 
   const intFmt = new Intl.NumberFormat('zh-CN');
   const compactFmt = new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 });
@@ -396,14 +420,16 @@
   function keyStatusChip(key) {
     if (key.status === 'ready') return chip('就绪', 'good');
     if (key.status === 'cooling') return chip(`冷却 ${fmtCooldown(key.cooldownRemainingMs)}`, 'warn');
+    if (key.status === 'error') return chip('解密失败', 'bad');
     return chip('缺环境变量', 'bad');
   }
 
   function renderChannels(data) {
     state.channels = data.channels || [];
     state.channelsEditable = Boolean(data.editable);
+    state.secretStorage = data.secretStorage || { available: false, backend: '' };
     channelsNote.textContent = state.channelsEditable
-      ? '修改写入 config.yaml 并立即生效'
+      ? `修改写入 config.yaml 并立即生效；密钥保存方式：${state.secretStorage.backend || '未知'}`
       : '当前服务未加载配置文件路径，渠道只读';
     addChannelBtn.disabled = !state.channelsEditable;
 
@@ -531,6 +557,8 @@
           line.append(el('span', 'key-name', key.label));
           line.append(el('span', 'key-secret', key.hasKey ? key.masked : '未设置'));
           if (key.keyEnv) line.append(el('span', 'key-stats', `env: ${key.keyEnv}`));
+          else if (key.encrypted) line.append(el('span', 'key-stats', '已加密'));
+          else if (key.hasKey) line.append(chip('明文', 'bad'));
           line.append(keyStatusChip(key));
           list.append(line);
         }
@@ -815,6 +843,8 @@
     const sub = el('div', 'row-sub');
     sub.append(el('span', 'key-secret', key.hasKey ? key.masked : '未设置'));
     if (key.keyEnv) sub.append(el('span', 'key-stats', `env: ${key.keyEnv}`));
+    else if (key.encrypted) sub.append(el('span', 'key-stats', '已加密'));
+    else if (key.hasKey) sub.append(chip('明文', 'bad'));
     sub.append(keyStatusChip(key));
     row.append(sub);
 
@@ -822,7 +852,7 @@
     for (const [value, text] of [
       ['keep', '保留密钥'],
       ['set_env', '改用环境变量'],
-      ['set_key', '更换密钥'],
+      ['set_key', '更换密钥（加密保存）'],
       ['remove', '删除密钥'],
     ]) {
       const option = el('option', '', text);
@@ -866,10 +896,13 @@
     row.append(label);
 
     const mode = el('select', 'key-mode');
-    for (const [value, text] of [
-      ['env', '环境变量'],
-      ['key', '直接填写密钥'],
-    ]) {
+    const modes = state.secretStorage.available
+      ? [
+          ['key', '加密保存（推荐）'],
+          ['env', '环境变量'],
+        ]
+      : [['env', '环境变量']];
+    for (const [value, text] of modes) {
       const option = el('option', '', text);
       option.value = value;
       mode.append(option);
@@ -888,7 +921,7 @@
         const input = el('input', 'key-input');
         input.type = 'password';
         input.autocomplete = 'off';
-        input.placeholder = '密钥值（会明文写入本机 config.yaml）';
+        input.placeholder = '密钥值（保存时加密，不落明文）';
         field.append(input);
       }
     };
@@ -958,10 +991,16 @@
     upstreamInput.placeholder = '上游名；opencode 填 providerID/modelID';
     upstreamInput.value = model.upstream ?? '';
     upstreamInput.autocomplete = 'off';
+    upstreamInput.setAttribute('list', 'upstream-options');
     upstreamInput.addEventListener('input', () => {
       const current = state.editingModels[state.selectedModelIndex];
       if (current) current.upstream = upstreamInput.value.trim() || undefined;
       refreshSelectedOptionText();
+    });
+    // 输入值命中探测候选（datalist 选择或手输）时，自动回填其余留空字段。
+    upstreamInput.addEventListener('change', () => {
+      const candidate = findProbedCandidate(upstreamInput.value);
+      if (candidate) applyProbedModel(candidate);
     });
 
     const contextInput = el('input', 'm-context');
@@ -1123,6 +1162,13 @@
     for (const node of document.querySelectorAll('#channel-dialog .cli-only')) {
       node.hidden = !(isOpenCode || isZcode || isQoder);
     }
+    // 只有 openai-compatible / opencode 具备上游模型目录；其余类型提示手填。
+    const probeSupported = isOpenAI || isOpenCode;
+    probeModelsBtn.hidden = !probeSupported;
+    modelPrefixesRow.hidden = !probeSupported;
+    if (!probeSupported) {
+      resetProbeState();
+    }
   }
 
   function openChannelDialog(channel) {
@@ -1140,10 +1186,17 @@
 
     $('#ch-priority').value = String(channel?.priority ?? 100);
     $('#ch-enabled').checked = channel ? channel.enabled : true;
+    const prefixRules = channel?.opencode?.modelPrefixes ?? channel?.modelPrefixes ?? {};
+    modelPrefixesInput.value = Object.entries(prefixRules)
+      .map(([pattern, prefix]) => `${pattern}=${prefix}`)
+      .join('\n');
     $('#ch-base-url').value = channel?.baseUrl ?? '';
     $('#ch-auth-header').value = channel?.authHeader ?? 'bearer';
     $('#ch-token-field').value = channel?.tokenLimitField ?? 'max_tokens';
     $('#ch-stream-options').checked = channel ? channel.sendStreamOptions !== false : true;
+    $('#ch-models-url').value = channel?.modelsUrl ?? '';
+    $('#ch-user-agent').value = channel?.userAgent ?? '';
+    $('#ch-session-header').value = channel?.sessionHeader ?? '';
     const bridge = channel?.opencode ?? channel?.zcode ?? channel?.qoder ?? null;
     $('#ch-command').value =
       bridge?.command ??
@@ -1193,6 +1246,7 @@
     renderModelPicker();
     renderModelForm();
 
+    resetProbeState();
     updateChannelTypeVisibility();
     channelDialog.showModal();
     if (!channel) idInput.focus();
@@ -1294,13 +1348,33 @@
     });
   }
 
-  function buildChannelPayload() {
+  /** 解析“模型名前缀规则”文本域：每行 模式=前缀，空行忽略。 */
+  function parseModelPrefixRules(text) {
+    const rules = {};
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const eq = trimmed.indexOf('=');
+      if (eq <= 0) throw new Error(`前缀规则行格式错误（应为 模式=前缀）：${trimmed}`);
+      const pattern = trimmed.slice(0, eq).trim();
+      const prefix = trimmed.slice(eq + 1).trim();
+      if (!pattern || !prefix || /\s/.test(prefix) || /\s/.test(pattern)) {
+        throw new Error(`前缀规则行不合法（模式与前缀不能含空白）：${trimmed}`);
+      }
+      if (rules[pattern] !== undefined) throw new Error(`前缀规则模式重复：${pattern}`);
+      rules[pattern] = prefix;
+    }
+    return rules;
+  }
+
+  function buildChannelPayload(forProbe = false) {
     const id = $('#ch-id').value.trim();
     if (!id) throw new Error('请填写渠道 ID');
     const type = $('#ch-type').value;
     const priority = readOptionalInteger($('#ch-priority').value, '优先级', -1000000);
     const autoModels = type === 'opencode' && $('#ch-auto-models').checked;
-    const models = collectModels(autoModels);
+    // 探测只关心渠道连接字段；跳过模型卡片校验，未填完的“新模型”卡片不应阻塞探测。
+    const models = forProbe ? [] : collectModels(autoModels);
     const payload = {
       id,
       type,
@@ -1308,6 +1382,7 @@
       enabled: $('#ch-enabled').checked,
       models,
       keys: [],
+      modelPrefixes: parseModelPrefixRules(modelPrefixesInput.value),
     };
     if (type === 'openai-compatible') {
       const baseUrl = $('#ch-base-url').value.trim();
@@ -1316,6 +1391,9 @@
       payload.authHeader = $('#ch-auth-header').value;
       payload.tokenLimitField = $('#ch-token-field').value;
       payload.sendStreamOptions = $('#ch-stream-options').checked;
+      payload.modelsUrl = $('#ch-models-url').value.trim();
+      payload.userAgent = $('#ch-user-agent').value.trim();
+      payload.sessionHeader = $('#ch-session-header').value.trim();
       payload.keys = collectKeys();
     } else if (type === 'opencode') {
       payload.flavor = $('#ch-flavor').value;
@@ -1447,6 +1525,164 @@
       payload.keys = [];
     }
     return payload;
+  }
+
+  function setProbeStatus(text) {
+    probeStatus.textContent = text;
+    probeStatus.hidden = !text;
+  }
+
+  function resetProbeState() {
+    state.probedModels = [];
+    upstreamOptions.replaceChildren();
+    probeResults.replaceChildren();
+    probeResults.hidden = true;
+    setProbeStatus('');
+  }
+
+  function probedModelMeta(candidate) {
+    const parts = [];
+    if (candidate.contextWindow) parts.push(`上下文 ${compactFmt.format(candidate.contextWindow)}`);
+    if (candidate.maxOutputTokens) parts.push(`输出 ${compactFmt.format(candidate.maxOutputTokens)}`);
+    const caps = candidate.capabilities ?? {};
+    const capText = [caps.tools && '工具', caps.vision && '视觉', caps.reasoning && '推理']
+      .filter(Boolean)
+      .join('/');
+    if (capText) parts.push(capText);
+    const pricing = candidate.pricing;
+    if (
+      pricing &&
+      (pricing.inputPerMtok !== undefined || pricing.outputPerMtok !== undefined)
+    ) {
+      parts.push(`$${pricing.inputPerMtok ?? '?'}/$${pricing.outputPerMtok ?? '?'} /Mtok`);
+    }
+    return parts.join(' · ');
+  }
+
+  function renderProbeResults() {
+    probeResults.replaceChildren();
+    if (!state.probedModels.length) {
+      probeResults.hidden = true;
+      return;
+    }
+    const details = el('details', 'probe-details');
+    details.open = true;
+    details.append(
+      el('summary', null, `候选列表（${state.probedModels.length}）— 点击填入当前模型`),
+    );
+    for (const candidate of state.probedModels) {
+      const row = el('div', 'probe-row');
+      const pick = el('button', 'mini probe-pick');
+      pick.type = 'button';
+      pick.textContent =
+        candidate.upstream && candidate.upstream !== candidate.id
+          ? `${candidate.id} → ${candidate.upstream}`
+          : candidate.id;
+      const meta = el('span', 'muted probe-meta', probedModelMeta(candidate));
+      pick.title = meta.textContent || pick.textContent;
+      pick.addEventListener('click', () => applyProbedModel(candidate));
+      row.append(pick, meta);
+      details.append(row);
+    }
+    probeResults.append(details);
+    probeResults.hidden = false;
+  }
+
+  function populateUpstreamDatalist() {
+    upstreamOptions.replaceChildren();
+    for (const candidate of state.probedModels) {
+      const option = el('option');
+      option.value = candidate.upstream || candidate.id;
+      if (candidate.upstream && candidate.upstream !== candidate.id) option.label = candidate.id;
+      upstreamOptions.append(option);
+    }
+  }
+
+  function findProbedCandidate(value) {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    return state.probedModels.find((m) => m.upstream === trimmed || m.id === trimmed) ?? null;
+  }
+
+  /** 把探测候选回填到当前模型卡片：upstream 必填，其余仅在留空时采用，能力勾选只做升级。 */
+  function applyProbedModel(candidate) {
+    syncFormToSelectedModel();
+    const model = state.editingModels[state.selectedModelIndex];
+    if (!model || !candidate) return;
+    model.upstream = candidate.upstream || candidate.id || model.upstream;
+    if (!model.id) model.id = candidate.id;
+    if (!model.contextWindow && candidate.contextWindow) {
+      model.contextWindow = candidate.contextWindow;
+    }
+    if (!model.maxOutputTokens && candidate.maxOutputTokens) {
+      model.maxOutputTokens = candidate.maxOutputTokens;
+    }
+    if (candidate.pricing) {
+      const inputPerMtok = model.pricing?.inputPerMtok ?? candidate.pricing.inputPerMtok;
+      const outputPerMtok = model.pricing?.outputPerMtok ?? candidate.pricing.outputPerMtok;
+      if (inputPerMtok !== undefined || outputPerMtok !== undefined) {
+        model.pricing = { inputPerMtok, outputPerMtok };
+      }
+    }
+    model.capabilities = {
+      tools: model.capabilities.tools || Boolean(candidate.capabilities?.tools),
+      vision: model.capabilities.vision || Boolean(candidate.capabilities?.vision),
+      reasoning: model.capabilities.reasoning || Boolean(candidate.capabilities?.reasoning),
+    };
+    renderModelPicker();
+    renderModelForm();
+  }
+
+  async function probeUpstreamModels() {
+    if (state.probeBusy) return;
+    const type = $('#ch-type').value;
+    $('#channel-form-error').hidden = true;
+    state.probeBusy = true;
+    probeModelsBtn.disabled = true;
+    setProbeStatus(
+      type === 'opencode'
+        ? '探测中…（opencode 需要拉起 CLI，可能需要几十秒）'
+        : '探测中…',
+    );
+    try {
+      const payload = buildChannelPayload(true);
+      const response = await fetch('/admin/api/channels/probe-models', {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${state.token}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (response.status === 401) {
+        setLoggedIn(false);
+        throw new Error('登录已失效，请重新登录');
+      }
+      if (!response.ok) {
+        throw new Error(body?.error?.message || `探测失败（HTTP ${response.status}）`);
+      }
+      state.probedModels = Array.isArray(body.models) ? body.models : [];
+      populateUpstreamDatalist();
+      renderProbeResults();
+      if (!state.probedModels.length) {
+        const hint =
+          type === 'opencode' && $('#ch-model-filter').value.trim()
+            ? '；检查“模型过滤”白名单是否放行'
+            : '';
+        setProbeStatus(`上游没有返回可用模型${hint}`);
+      } else {
+        setProbeStatus(
+          `探测到 ${state.probedModels.length} 个上游模型：点击候选填入当前模型，或在“上游模型名”输入框下拉选择`,
+        );
+      }
+    } catch (error) {
+      resetProbeState();
+      setProbeStatus(`探测失败：${error.message}`);
+    } finally {
+      state.probeBusy = false;
+      probeModelsBtn.disabled = false;
+    }
   }
 
   async function saveChannel() {
@@ -1664,6 +1900,154 @@
     }
   }
 
+  const PRIVACY_CATEGORY_LABELS = {
+    config_secret: '配置密钥',
+    api_key: 'API Key',
+    jwt: 'JWT',
+    assignment: '口令赋值',
+    private_key: '私钥块',
+    connection: '连接串',
+    bearer: 'Bearer',
+    identity_path: '用户目录',
+    email: '邮箱',
+    uid: '用户名/UID',
+    restore: '还原',
+  };
+  const PRIVACY_ACTION_LABELS = { detected: '检出', tokenized: '已替换', restored: '已还原' };
+  const PRIVACY_ACTION_TONES = { detected: 'warn', tokenized: 'good', restored: 'idle' };
+
+  function renderPrivacy(data) {
+    state.privacyEditable = data.editable !== false;
+    privacyNote.textContent = state.privacyEditable ? '' : '当前配置只读';
+    privacySaveBtn.disabled = !state.privacyEditable;
+    const status = data.status || {};
+    const modeLabel = { off: '关闭', audit: '仅审计', token: '令牌化' }[status.mode] || status.mode;
+    const parts = [`当前生效：${modeLabel}`];
+    if (status.degraded) parts.push('⚠ 加密不可用，token 已降级为 audit');
+    parts.push(`精确保护 ${status.configSecrets ?? 0} 个配置密钥`);
+    parts.push(`保管库 ${status.vaultEntries ?? 0} 条`);
+    if (status.secretStorage) parts.push(`加密后端：${status.secretStorage.backend}`);
+    const totals = data.totals || {};
+    parts.push(`区间内检出 ${totals.detected ?? 0} / 替换 ${totals.tokenized ?? 0} / 还原 ${totals.restored ?? 0}`);
+    privacyStatus.textContent = parts.join(' · ');
+
+    if (!state.privacyDirty) {
+      const cfg = data.config || {};
+      privacyMode.value = cfg.mode || 'off';
+      privacyIdentity.checked = Boolean(cfg.identity);
+      privacyConfigSecrets.checked = cfg.protectConfigSecrets !== false;
+      privacyInclude.value = (cfg.providers?.include || []).join(', ');
+      privacyExclude.value = (cfg.providers?.exclude || []).join(', ');
+      privacyRetention.value = String(cfg.tokenRetentionDays ?? 30);
+      privacyMaxVault.value = String(cfg.maxVaultEntries ?? 5000);
+    }
+
+    privacyEventsBody.replaceChildren();
+    const events = data.events || [];
+    if (!events.length) {
+      const tr = el('tr');
+      const cell = td('该区间暂无隐私事件', 'empty');
+      cell.colSpan = 7;
+      tr.append(cell);
+      privacyEventsBody.append(tr);
+    }
+    for (const item of events) {
+      const tr = el('tr');
+      tr.append(td(fmtTime(item.ts)));
+      tr.append(td(item.provider));
+      tr.append(td(item.direction === 'outbound' ? '出站' : '入站'));
+      tr.append(td(PRIVACY_CATEGORY_LABELS[item.category] || item.category));
+      const actionCell = el('td');
+      actionCell.append(
+        chip(PRIVACY_ACTION_LABELS[item.action] || item.action, PRIVACY_ACTION_TONES[item.action] || 'idle'),
+      );
+      tr.append(actionCell);
+      tr.append(td(fmtInt(item.count), 'num'));
+      tr.append(td(item.masked || '—'));
+      privacyEventsBody.append(tr);
+    }
+
+    privacyVaultBody.replaceChildren();
+    const vault = data.vault || [];
+    privacyVaultNote.textContent = `占位符 → 加密真值，明文不出本机（共 ${status.vaultEntries ?? vault.length} 条，显示最近 ${vault.length} 条）`;
+    if (!vault.length) {
+      const tr = el('tr');
+      const cell = td('保管库为空', 'empty');
+      cell.colSpan = 5;
+      tr.append(cell);
+      privacyVaultBody.append(tr);
+    }
+    for (const row of vault) {
+      const tr = el('tr');
+      tr.append(td(row.placeholder));
+      tr.append(td(PRIVACY_CATEGORY_LABELS[row.category] || row.category));
+      tr.append(td(row.masked));
+      tr.append(td(fmtInt(row.hits), 'num'));
+      tr.append(td(fmtTime(row.lastUsedAt)));
+      privacyVaultBody.append(tr);
+    }
+  }
+
+  function markPrivacyDirty() {
+    state.privacyDirty = true;
+    privacyNote.textContent = '有未保存的修改';
+  }
+
+  function privacyInt(value, name, min, max) {
+    const n = Number(String(value).trim());
+    if (!Number.isInteger(n) || n < min || n > max) {
+      throw new Error(`${name} 必须是 ${min}–${max} 的整数`);
+    }
+    return n;
+  }
+
+  function splitIds(value) {
+    return String(value)
+      .split(/[,，\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  async function savePrivacy() {
+    try {
+      const payload = {
+        mode: privacyMode.value,
+        identity: privacyIdentity.checked,
+        protectConfigSecrets: privacyConfigSecrets.checked,
+        providers: {
+          include: splitIds(privacyInclude.value),
+          exclude: splitIds(privacyExclude.value),
+        },
+        tokenRetentionDays: privacyInt(privacyRetention.value, '保留天数', 1, 3650),
+        maxVaultEntries: privacyInt(privacyMaxVault.value, '保管库容量', 10, 100000),
+      };
+      privacySaveBtn.disabled = true;
+      const response = await fetch('/admin/api/privacy', {
+        method: 'PUT',
+        headers: {
+          authorization: `Bearer ${state.token}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (response.status === 401) {
+        setLoggedIn(false);
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(body?.error?.message || `保存失败（HTTP ${response.status}）`);
+      }
+      state.privacyDirty = false;
+      showToast('隐私守卫设置已保存并热加载');
+      await refresh();
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      privacySaveBtn.disabled = !state.privacyEditable;
+    }
+  }
+
   async function refresh() {
     if (!state.token || state.loading) return;
     state.loading = true;
@@ -1673,7 +2057,11 @@
         if (error instanceof AuthError) throw error;
         return null;
       });
-      const [overview, requests, models, channelData, questionData, retryData] =
+      const privacyRequest = api(`/admin/api/privacy?range=${encodeURIComponent(range)}`).catch((error) => {
+        if (error instanceof AuthError) throw error;
+        return null;
+      });
+      const [overview, requests, models, channelData, questionData, retryData, privacyData] =
         await Promise.all([
           api(`/admin/api/overview?range=${encodeURIComponent(range)}`),
           api(`/admin/api/requests?range=${encodeURIComponent(range)}&limit=100`),
@@ -1681,6 +2069,7 @@
           api('/admin/api/channels'),
           api('/admin/api/questions'),
           retryRequest,
+          privacyRequest,
         ]);
       renderOverview(overview);
       renderRequests(requests.requests || []);
@@ -1693,6 +2082,13 @@
         state.retryEditable = false;
         retrySaveBtn.disabled = true;
         retryNote.textContent = '当前运行版本不支持重试设置，重启网关后可用';
+      }
+      if (privacyData) {
+        renderPrivacy(privacyData);
+      } else {
+        state.privacyEditable = false;
+        privacySaveBtn.disabled = true;
+        privacyNote.textContent = '当前运行版本不支持隐私守卫，重启网关后可用';
       }
       setConn(true);
       setLoggedIn(true);
@@ -1768,6 +2164,20 @@
   retryCategoriesEl.addEventListener('change', markRetryDirty);
   retrySaveBtn.addEventListener('click', () => void saveRetry());
 
+  for (const node of [
+    privacyMode,
+    privacyIdentity,
+    privacyConfigSecrets,
+    privacyInclude,
+    privacyExclude,
+    privacyRetention,
+    privacyMaxVault,
+  ]) {
+    node.addEventListener('input', markPrivacyDirty);
+    node.addEventListener('change', markPrivacyDirty);
+  }
+  privacySaveBtn.addEventListener('click', () => void savePrivacy());
+
   addChannelBtn.addEventListener('click', () => openChannelDialog(null));
   $('#probe-btn').addEventListener('click', () =>
     void runMaintenance('/admin/api/maintenance/probe', '探活完成'),
@@ -1787,6 +2197,7 @@
     renderModelPicker();
     renderModelForm();
   });
+  probeModelsBtn.addEventListener('click', () => void probeUpstreamModels());
   modelPicker.addEventListener('change', () => {
     syncFormToSelectedModel();
     state.selectedModelIndex = Number(modelPicker.value);
@@ -1807,6 +2218,15 @@
     renderModelForm();
   });
   $('#ch-type').addEventListener('change', updateChannelTypeVisibility);
+  $('#ch-opencode-go-preset').addEventListener('click', () => {
+    $('#ch-base-url').value = 'https://opencode.ai/inference/go/openai/v1';
+    $('#ch-models-url').value = 'https://opencode.ai/inference/go/v1/models';
+    $('#ch-session-header').value = 'x-opencode-session';
+    $('#ch-auth-header').value = 'bearer';
+    if (!$('#ch-user-agent').value.trim()) {
+      $('#ch-user-agent').value = 'code2api-gateway/1.0';
+    }
+  });
 
   channelsBody.addEventListener('click', (event) => {
     const button = event.target.closest('button[data-channel-action]');

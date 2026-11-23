@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type {
   CanonicalMessage,
   CanonicalRequest,
@@ -8,10 +9,11 @@ import type {
   StreamEvent,
   Usage,
 } from '../canonical.js';
-import { estimateRequestTokens, roughTokenEstimate } from '../canonical.js';
+import { estimateRequestTokens, roughTokenEstimate, textOf } from '../canonical.js';
 import type { ModelConfig, OpenAIProviderConfig } from '../config.js';
 import { UpstreamError } from '../errors.js';
 import { APP_VERSION } from '../config.js';
+import { log } from '../logger.js';
 import type {
   ChatContext,
   DetectedCapabilities,
@@ -62,6 +64,49 @@ function endpoint(baseUrl: string, path: string): string {
   return `${baseUrl.replace(/\/+$/, '')}${path}`;
 }
 
+/**
+ * 上游会话头（如 OpenCode Go 的 x-opencode-session）只接受可见 ASCII。
+ * 客户端没给可用会话 ID 时按首条用户消息生成指纹，保证同一会话跨轮稳定；
+ * 每轮换 ID 会让上游 prompt cache 失效，静态 ID 则会把所有会话挤进同一路由桶。
+ */
+const SESSION_VALUE_PATTERN = /^[\x21-\x7e]{1,200}$/;
+/** 网关内部的一次性 ID（Responses 的 resp_xx 等）不是会话标识，不能直接透传。 */
+const EPHEMERAL_SESSION_PREFIXES = ['resp_', 'chatcmpl-'] as const;
+
+function conversationBasis(request: CanonicalRequest): string {
+  const anchor =
+    request.messages.find((message) => message.role === 'user') ?? request.messages[0];
+  if (!anchor) return `model:${request.model}`;
+  const text = textOf(anchor.parts).trim();
+  if (text) return text.slice(0, 8192);
+  try {
+    return `${anchor.role}:${JSON.stringify(anchor.parts).slice(0, 8192)}`;
+  } catch {
+    return `${anchor.role}:${request.model}`;
+  }
+}
+
+function generatedSessionId(request: CanonicalRequest): string {
+  const digest = createHash('sha256')
+    .update('code2api-session-v1\u0000')
+    .update(conversationBasis(request))
+    .digest('hex')
+    .slice(0, 32);
+  return `ses_${digest}`;
+}
+
+function sessionIdFor(request: CanonicalRequest): string {
+  const supplied = request.sessionId?.trim();
+  if (
+    supplied &&
+    SESSION_VALUE_PATTERN.test(supplied) &&
+    !EPHEMERAL_SESSION_PREFIXES.some((prefix) => supplied.startsWith(prefix))
+  ) {
+    return supplied;
+  }
+  return generatedSessionId(request);
+}
+
 function imageUrlOf(part: ContentPart & { type: 'image' }): string | null {
   if (part.url) return part.url;
   if (part.data) {
@@ -98,7 +143,10 @@ function toolCallsOf(parts: ContentPart[]): Array<{ id: string; name: string; ar
   return calls;
 }
 
-function toOpenAIMessages(messages: CanonicalMessage[]): unknown[] {
+function toOpenAIMessages(
+  messages: CanonicalMessage[],
+  replayReasoning: boolean,
+): unknown[] {
   const out: unknown[] = [];
   for (const message of messages) {
     if (message.role === 'assistant') {
@@ -106,9 +154,20 @@ function toOpenAIMessages(messages: CanonicalMessage[]): unknown[] {
       const content = partsToContent(
         message.parts.filter((p) => p.type !== 'tool_call' && p.type !== 'thinking'),
       );
+      // DeepSeek 思考模式要求把上一轮的 reasoning_content 原样带回，
+      // 否则多轮请求会 400；上游不接受时由 stripReasoning 重试剥离。
+      const thinking = replayReasoning
+        ? message.parts
+            .filter((part): part is Extract<ContentPart, { type: 'thinking' }> =>
+              part.type === 'thinking',
+            )
+            .map((part) => part.text)
+            .join('')
+        : '';
       out.push({
         role: 'assistant',
         content: content || (calls.length ? null : ''),
+        ...(thinking ? { reasoning_content: thinking } : {}),
         ...(calls.length
           ? {
               tool_calls: calls.map((call) => ({
@@ -389,13 +448,21 @@ interface OpenResult {
 export class OpenAICompatibleAdapter implements ProviderAdapter {
   constructor(private readonly cfg: OpenAIProviderConfig) {}
 
-  private headers(stream: boolean, key: string | null): Record<string, string> {
+  private headers(
+    stream: boolean,
+    key: string | null,
+    sessionId?: string,
+  ): Record<string, string> {
     const headers: Record<string, string> = {
       'content-type': 'application/json',
       accept: stream ? 'text/event-stream' : 'application/json',
-      'user-agent': `code2api/${APP_VERSION}`,
+      'user-agent': this.cfg.userAgent ?? `code2api/${APP_VERSION}`,
       ...this.cfg.extraHeaders,
     };
+    if (this.cfg.sessionHeader && sessionId) {
+      headers[this.cfg.sessionHeader] = sessionId;
+      log.debug(`上游会话 ${this.cfg.id} ${this.cfg.sessionHeader}=${sessionId}`);
+    }
     if (key) {
       if (this.cfg.authHeader === 'bearer') headers.authorization = `Bearer ${key}`;
       else headers['x-api-key'] = key;
@@ -417,7 +484,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     const body: Record<string, unknown> = {
       ...request.extraBody,
       model: model.upstream,
-      messages: toOpenAIMessages(request.messages),
+      messages: toOpenAIMessages(request.messages, !opts.stripReasoning),
       stream,
     };
     if (maxTokens !== undefined) body[opts.tokenField] = maxTokens;
@@ -456,6 +523,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     stream: boolean,
     ctx: ChatContext,
     headerTimeoutMs: number,
+    sessionId?: string,
   ): Promise<OpenResult> {
     if (ctx.signal.aborted) {
       throw new UpstreamError('client aborted', { category: 'cancelled', retryable: false });
@@ -471,7 +539,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     try {
       const res = await fetch(endpoint(this.cfg.baseUrl, '/chat/completions'), {
         method: 'POST',
-        headers: this.headers(stream, ctx.key),
+        headers: this.headers(stream, ctx.key, sessionId),
         body: JSON.stringify(body),
         signal: controller.signal,
       });
@@ -589,13 +657,20 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
   ): Promise<CanonicalResponse> {
     let tokenField = this.cfg.tokenLimitField;
     let stripReasoning = false;
+    const sessionId = this.cfg.sessionHeader ? sessionIdFor(request) : undefined;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const body = this.buildBody(request, model, false, {
         tokenField,
         streamOptions: false,
         stripReasoning,
       });
-      const opened = await this.open(body, false, ctx, this.cfg.timeouts.ttfbMs);
+      const opened = await this.open(
+        body,
+        false,
+        ctx,
+        this.cfg.timeouts.ttfbMs,
+        sessionId,
+      );
       if (!opened.res.ok) {
         const error = await this.toUpstreamError(opened.res, opened.controller);
         opened.dispose();
@@ -679,10 +754,18 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
   async listModels(key: string | null, timeoutMs: number): Promise<UpstreamModelInfo[]> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), Math.max(1000, timeoutMs));
+    // 目录请求不是会话，但部分上游（Go）要求每个请求都带会话头；
+    // 用渠道维度的稳定 ID，避免无头被拒。
+    const sessionId = this.cfg.sessionHeader
+      ? `ses_${createHash('sha256')
+          .update(`code2api-catalog\u0000${this.cfg.id}`)
+          .digest('hex')
+          .slice(0, 32)}`
+      : undefined;
     try {
-      const res = await fetch(endpoint(this.cfg.baseUrl, '/models'), {
+      const res = await fetch(this.cfg.modelsUrl ?? endpoint(this.cfg.baseUrl, '/models'), {
         method: 'GET',
-        headers: this.headers(false, key),
+        headers: this.headers(false, key, sessionId),
         signal: controller.signal,
       });
       if (!res.ok) {
@@ -788,6 +871,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     let streamOptions = this.cfg.sendStreamOptions;
     let stripReasoning = false;
     let opened: OpenResult | null = null;
+    const sessionId = this.cfg.sessionHeader ? sessionIdFor(request) : undefined;
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const body = this.buildBody(request, model, true, {
@@ -795,7 +879,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
         streamOptions,
         stripReasoning,
       });
-      opened = await this.open(body, true, ctx, this.cfg.timeouts.ttfbMs);
+      opened = await this.open(body, true, ctx, this.cfg.timeouts.ttfbMs, sessionId);
       if (opened.res.ok) break;
       const error = await this.toUpstreamError(opened.res, opened.controller);
       opened.dispose();

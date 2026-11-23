@@ -247,6 +247,62 @@ providers:
   }
 });
 
+test('模型目录同步：model_prefixes 给同步模型对外名加前缀', async () => {
+  const fake = await startFake({
+    models: [
+      { id: 'gpt-5', context_length: 128000, supported_parameters: ['tools'] },
+      { id: 'other-model' },
+    ],
+  });
+  const harness = await startGateway(`
+server:
+  port: 0
+admin:
+  token: test-admin
+storage:
+  path: __DB__
+catalog:
+  sync_enabled: true
+  sync_on_start: true
+providers:
+  - id: fake
+    type: openai-compatible
+    base_url: ${fake.baseUrl}/v1
+    keys:
+      - label: good
+        key: ok-key
+    model_prefixes:
+      "gpt-5*": "Go/"
+    models:
+      - id: manual
+        upstream: unrelated-upstream
+        capabilities:
+          tools: true
+`);
+  try {
+    const admin = await adminGet(harness, '/admin/api/models');
+    const prefixed = admin.models.find((m: any) => m.id === 'Go/gpt-5');
+    // 自动发现模型带前缀，upstream 保持原始名；手工模型不受影响。
+    assert.ok(prefixed, '应包含 Go/gpt-5');
+    assert.equal(prefixed.upstream, 'gpt-5');
+    assert.equal(prefixed.source, 'upstream');
+    assert.equal(prefixed.contextWindow, 128000);
+    assert.ok(admin.models.find((m: any) => m.id === 'other-model'));
+    assert.equal(admin.models.find((m: any) => m.id === 'manual').source, 'config');
+
+    // 前缀名可正常路由到上游原始名。
+    const routed = await chat(harness, {
+      model: 'Go/gpt-5',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(routed.status, 200);
+    assert.equal(fake.bodies.at(-1)?.model, 'gpt-5');
+  } finally {
+    await harness.close();
+    await fake.close();
+  }
+});
+
 test('上下文窗口自动最大值：留空取目录最大，手工值优先', async () => {
   const fake = await startFake({
     models: [{ id: 'grow-model', context_length: 131072 }],

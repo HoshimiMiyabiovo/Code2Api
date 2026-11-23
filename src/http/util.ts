@@ -52,8 +52,12 @@ export function tokenMatches(token: string | undefined, expected: string[]): boo
 }
 
 export function sessionIdOf(request: FastifyRequest): string | null {
-  const raw = request.headers['x-code2api-session'];
-  if (typeof raw === 'string' && raw.trim()) return raw.trim().slice(0, 200);
+  // x-code2api-session 是网关自有的会话头；x-opencode-session 允许客户端直接透传
+  // （OpenCode Go 的会话标识），网关在配置了 session_header 时会原样带上去。
+  for (const name of ['x-code2api-session', 'x-opencode-session'] as const) {
+    const raw = request.headers[name];
+    if (typeof raw === 'string' && raw.trim()) return raw.trim().slice(0, 200);
+  }
   return null;
 }
 

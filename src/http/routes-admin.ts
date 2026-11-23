@@ -5,19 +5,24 @@ import { fileURLToPath } from 'node:url';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { APP_VERSION } from '../config.js';
 import {
+  buildProvider,
   deleteChannel,
   parseChannelInput,
+  parsePrivacyInput,
   parseRetryInput,
+  updatePrivacyPolicy,
   updateRetryPolicy,
   upsertChannel,
 } from '../core/config-editor.js';
 import { maskKey } from '../core/keys.js';
+import { guessReasoningModel, matchModelPrefix, withTimeout } from '../core/model-catalog.js';
+import { isSecretEncryptionAvailable, secretBackendLabel } from '../core/secrets.js';
 import type { ProviderMonitorSnapshot } from '../core/pool-supervisor.js';
 import { GatewayError } from '../errors.js';
 import { OpenCodeAdapter, type PendingQuestionView } from '../providers/opencode.js';
 import { QoderAdapter } from '../providers/qoder.js';
+import { createAdapter, type ProviderRuntime } from '../providers/registry.js';
 import { ZcodeAdapter } from '../providers/zcode.js';
-import type { ProviderRuntime } from '../providers/registry.js';
 import type { ProviderKeyStats } from '../store/db.js';
 import type { GatewayContext } from './context.js';
 import { extractClientToken, parseRange, tokenMatches } from './util.js';
@@ -87,7 +92,15 @@ function channelView(
             masked: maskKey(key.key),
             keyEnv: key.keyEnv ?? null,
             hasKey: key.key !== null,
-            status: state?.status ?? (key.missingEnv ? 'missing_env' : 'ready'),
+            encrypted: Boolean(key.keyEnc),
+            keyError: key.keyError ?? null,
+            status:
+              state?.status ??
+              (key.missingEnv
+                ? 'missing_env'
+                : key.keyError
+                  ? 'error'
+                  : 'ready'),
             cooldownRemainingMs: state?.cooldownRemainingMs ?? 0,
           };
         })
@@ -104,12 +117,19 @@ function channelView(
       config.type === 'openai-compatible' ? config.tokenLimitField : null,
     sendStreamOptions:
       config.type === 'openai-compatible' ? config.sendStreamOptions : null,
+    userAgent: config.type === 'openai-compatible' ? config.userAgent ?? null : null,
+    modelsUrl: config.type === 'openai-compatible' ? config.modelsUrl ?? null : null,
+    sessionHeader:
+      config.type === 'openai-compatible' ? config.sessionHeader ?? null : null,
+    modelPrefixes:
+      config.type === 'openai-compatible' ? config.modelPrefixes ?? null : null,
     opencode:
       config.type === 'opencode'
         ? {
             flavor: config.flavor,
             codeartsDataDir: config.codeartsDataDir ?? null,
             modelFilter: config.modelFilter,
+            modelPrefixes: config.modelPrefixes ?? null,
             command: config.command,
             workspace: config.workspace,
             workspaceRoots: config.workspaceRoots,
@@ -245,6 +265,10 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: GatewayContext): 
     async (_request: FastifyRequest, reply: FastifyReply) => {
       return reply.header('cache-control', 'no-store').send({
         editable: Boolean(ctx.configPath),
+        secretStorage: {
+          available: isSecretEncryptionAvailable(),
+          backend: secretBackendLabel(),
+        },
         channels: ctx.registry.providers.map((provider) =>
           channelView(provider, ctx.supervisor.snapshot(provider.id)),
         ),
@@ -292,6 +316,105 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: GatewayContext): 
         const result = await upsertChannel(ctx.configPath, input, 'create');
         await ctx.applyConfig(result.config);
         return reply.send({ ok: true, warnings: result.warnings });
+      } catch (error) {
+        return channelError(reply, error);
+      }
+    },
+  );
+
+  // 用面板表单里的草稿配置临时探测上游模型目录；只读预览，不写 YAML、不进 registry。
+  app.post(
+    '/admin/api/channels/probe-models',
+    { preHandler: adminGuard },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      try {
+        const input = parseChannelInput(request.body);
+        const existing = ctx.config.providers.find((provider) => provider.id === input.id);
+        const config = buildProvider(input, existing);
+        if (config.type === 'mock') {
+          throw new GatewayError('mock 渠道无需探测上游模型', {
+            status: 400,
+            type: 'invalid_request_error',
+            code: 'config_invalid',
+          });
+        }
+        if (config.type === 'zcode' || config.type === 'qoder') {
+          throw new GatewayError(
+            `${config.type} 渠道没有模型目录可探测（CLI 协议不支持），请手工填写 providerId/modelId`,
+            { status: 400, type: 'invalid_request_error', code: 'config_invalid' },
+          );
+        }
+        const adapter = createAdapter(config, ctx.store);
+        try {
+          if (config.type === 'opencode') {
+            // 可能需要现场拉起 opencode CLI，超时给足。
+            const infos = await withTimeout(
+              (adapter as OpenCodeAdapter).listModelInfos(),
+              60000,
+              `opencode 渠道 ${config.id} 模型探测`,
+            );
+            return reply.send({
+              ok: true,
+              models: infos.map((info) => {
+                // 与模型目录同步一致：按渠道 model_prefixes 给候选对外名加前缀。
+                const prefix = matchModelPrefix(config.modelPrefixes, info.id, info.upstream);
+                return {
+                  id: prefix ? `${prefix}${info.id}` : info.id,
+                  upstream: info.upstream,
+                  contextWindow: info.contextWindow ?? null,
+                  maxOutputTokens: info.maxOutputTokens ?? null,
+                  capabilities: info.capabilities,
+                  pricing: info.pricing ?? null,
+                };
+              }),
+            });
+          }
+          const key = config.keys.find((item) => item.key !== null)?.key ?? null;
+          const timeoutMs = Math.min(config.timeouts.connectMs, 15000);
+          const infos = await withTimeout(
+            adapter.listModels!(key, timeoutMs),
+            timeoutMs + 5000,
+            `渠道 ${config.id} 模型探测`,
+          );
+          const catalogConfig = ctx.config.catalog;
+          return reply.send({
+            ok: true,
+            models: infos.map((info) => {
+              // 与模型目录同步保持一致：上游未声明能力时按 catalog 策略兜底。
+              const detected = info.capabilities ?? {};
+              let reasoning = detected.reasoning;
+              if (reasoning === undefined) {
+                reasoning = catalogConfig.strictCapabilities
+                  ? catalogConfig.reasoningHints && guessReasoningModel(info.id)
+                  : true;
+              }
+              const prefix = matchModelPrefix(config.modelPrefixes, info.id, info.id);
+              return {
+                id: prefix ? `${prefix}${info.id}` : info.id,
+                upstream: info.id,
+                contextWindow: info.contextWindow ?? null,
+                maxOutputTokens: null,
+                capabilities: {
+                  tools: detected.tools ?? true,
+                  vision: detected.vision ?? false,
+                  reasoning,
+                },
+                pricing: null,
+              };
+            }),
+          });
+        } catch (error) {
+          throw new GatewayError(`探测上游模型失败：${(error as Error).message}`, {
+            status: 502,
+            type: 'upstream_error',
+          });
+        } finally {
+          try {
+            await adapter.close?.();
+          } catch {
+            // 清理失败不影响探测结果
+          }
+        }
       } catch (error) {
         return channelError(reply, error);
       }
@@ -559,6 +682,61 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: GatewayContext): 
         const input = parseRetryInput(request.body);
         const result = await updateRetryPolicy(ctx.configPath, input);
         ctx.applyRetryConfig(result.config);
+        return reply.send({ ok: true, warnings: result.warnings });
+      } catch (error) {
+        return channelError(reply, error);
+      }
+    },
+  );
+
+  app.get(
+    '/admin/api/privacy',
+    { preHandler: adminGuard },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const query = (request.query ?? {}) as Record<string, unknown>;
+      const range = parseRange(query.range);
+      const limitRaw = Number(query.limit ?? 100);
+      const snapshot = ctx.privacy.snapshot();
+      return reply.header('cache-control', 'no-store').send({
+        editable: Boolean(ctx.configPath),
+        config: ctx.config.privacy,
+        status: {
+          ...snapshot,
+          secretStorage: {
+            available: isSecretEncryptionAvailable(),
+            backend: secretBackendLabel(),
+          },
+        },
+        totals: ctx.store.privacyEventTotals(range.sinceMs),
+        events: ctx.store.recentPrivacyEvents({
+          sinceMs: range.sinceMs,
+          limit: Number.isFinite(limitRaw) ? limitRaw : 100,
+        }),
+        vault: ctx.store.listPrivacyVault(100).map((row) => ({
+          placeholder: row.placeholder,
+          category: row.category,
+          masked: row.masked,
+          hits: row.hits,
+          createdAt: row.createdAt,
+          lastUsedAt: row.lastUsedAt,
+        })),
+      });
+    },
+  );
+
+  app.put(
+    '/admin/api/privacy',
+    { preHandler: adminGuard },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      if (!ctx.configPath) {
+        return reply.code(400).send({
+          error: { message: '当前服务未加载配置文件路径，无法编辑隐私守卫', type: 'invalid_request_error' },
+        });
+      }
+      try {
+        const input = parsePrivacyInput(request.body);
+        const result = await updatePrivacyPolicy(ctx.configPath, input);
+        await ctx.applyConfig(result.config);
         return reply.send({ ok: true, warnings: result.warnings });
       } catch (error) {
         return channelError(reply, error);

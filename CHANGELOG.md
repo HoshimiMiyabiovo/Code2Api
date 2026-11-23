@@ -6,6 +6,10 @@
 
 ### 新增
 
+- 隐私守卫（`privacy` 配置节 + 面板「隐私守卫」）：出站请求里的密钥 / 口令 / JWT / 私钥 / 连接串 / Bearer 等敏感值被替换为稳定占位符 `⟦p:<类别>:<8位哈希>⟧`，真值经 AES-256-GCM / DPAPI 加密后只存本地 SQLite 保管库（`privacy_vault`），上游模型永远不见明文；返回（含流式 delta 与工具参数）里的占位符在网关还原成真值再交给客户端，对 agent 透明。占位符 = HMAC(真值)，HMAC 密钥加密持久化在 `privacy_meta`，同一真值跨请求 / 跨重启映射同一占位符，不打散上游 prompt cache。三态模式 off / audit（只检测记录）/ token（替换+还原），默认 off；身份类检测（用户名/uid/邮箱/用户目录）单独开关；`protect_config_secrets` 精确匹配网关自身配置的密钥/口令（零误报）；按渠道 include/exclude 生效，桥接渠道（opencode/zcode/qoder）默认不启用（内部工具循环不在网关视野）。流式文本跨 delta 缓冲还原、工具参数按 index 聚合后整体还原；审计事件落 `privacy_events`（只存掩码样本，不存明文），面板展示检出/替换/还原统计与保管库。加密不可用时 token 自动降级 audit。新增 admin 端点 GET/PUT `/admin/api/privacy`（保存热加载）。补 17 项 fake 回归（检测规则、令牌化往返、占位符稳定性、流式逐字符拆分还原、工具参数还原、配置密钥精确保护、audit/off/exclude、tool_result、面板热加载、401）。
+- 渠道新增 `model_prefixes`（openai-compatible 与 opencode）：自动发现的模型按 upstream glob 匹配加对外名前缀，如 `"opencode-go/*": "Go/"` 把订阅渠道模型同步为 `Go/<modelID>`，与 `model_filter` 同一套匹配语义（裸 modelID 与 `providerID/modelID` 均可命中）；upstream 保持原始名、手工 models 不受影响，前缀名可直接路由（上游收到原始名）。面板渠道表单新增「模型名前缀规则」（每行 `模式=前缀`，openai/opencode 显示），「探测上游」的候选同样应用前缀规则，点选即填入 `Go/…`。补 fake 回归（opencode 订阅渠道同步前缀、openai 目录同步前缀、探测候选前缀）。
+- 面板添加/编辑模型支持一键「探测上游」：新增 admin 端点 `POST /admin/api/channels/probe-models`，用表单里的草稿配置临时构造适配器拉取上游模型目录（openai-compatible 走 `/models`/`models_url`，opencode 系走 `/api/model`、`/api/provider` 并沿用残影过滤与 `model_filter` 白名单），探测是只读预览，不写 YAML、不进 registry；编辑中的渠道服务端自动合并已存密钥（keep/env），密钥明文不出服务端。模型卡片「上游模型名」挂候选 datalist，点选候选或输入命中时自动回填模型 ID/上下文窗口/最大输出/价格/能力（仅回填留空项，能力勾选只升级不覆盖）；zcode/qoder 无模型目录，按钮隐藏并提示手填 `providerId/modelId`。配套 fake 上游回归（openai 目录、opencode 残影过滤、密钥合并、0 模型草稿可探测而保存仍要求至少一个模型）。
+- openai-compatible 渠道支持上游会话头与标识改写：`session_header` 按会话注入稳定 ID（如 OpenCode Go 的 `x-opencode-session`），`user_agent` 覆盖上游 User-Agent，`models_url` 覆盖模型目录地址（chat 与 models 路径不同的上游）。会话 ID 优先取客户端 `x-code2api-session` / `x-opencode-session` / `metadata.session_id`；缺失时按首条用户消息指纹生成 `ses_<32 位摘要>`，同一会话跨轮稳定；Responses 的一次性 `resp_*` 不会被当成会话 ID，避免每轮换 ID 导致上游 prompt cache 失效。面板渠道表单新增三个字段与「填入 OpenCode Go 预设」，并补 fake 上游回归（会话透传/生成、UA 改写、`models_url`）。
 - 请求内自动重试（429 回避）：对限流、5xx、超时、网络错误、空首包按指数退避 + 抖动重试；优先采用上游 `Retry-After`；所有渠道冷却时等待最早恢复而不是立即 503；流式仅在首包前重试；客户端取消会中断等待。
 - 面板新增“重试与限流回避”设置，可实时修改并热加载；配置项位于 `routing.retry`。
 - 新渠道类型 `zcode`：把本机 ZCode CLI 以 `app-server`（stdio NDJSON「ZCode Protocol」）方式拉起为任务级渠道。worker 池（会话亲和/空闲回收/重启预算）、会话绑定与台账增量去重（独立 `zc_*` 表）、`part.delta` 文本/推理增量归一化、`turn.completed` 用量透传、权限请求进面板「待处理提问」。凭据复用桌面端共享登录态（`~/.zcode/v2/credentials.json`），无自动模型发现（`models` 必填，upstream 为 `providerId/modelId`）。
@@ -15,6 +19,8 @@
 
 ### 修复
 
+- qoder fake server 的 state 落盘（`writeFileSync` 非原子）在高负载的全量测试下会被测试读到截断 JSON（`Unexpected end of JSON input`），`qoder.test.ts` 统一改为轮询容错读取。
+- OpenAI Chat 输入现在保留 assistant 历史里的 `reasoning_content` 并转发给 openai-compatible 上游（DeepSeek 思考模式的多轮请求要求原样带回，否则 400 `reasoning_content ... must be passed back`）；上游拒绝该字段时沿用既有 400 降级逻辑自动剥离并重试。补 fake 上游回归。
 - CodeArts 渠道流式对话一直无输出、最终被客户端取消：IDE 内核（v126.11.1 实测）的 SSE 负载是 `{type, properties}`，与原版/kilo 的 `{type, data}` 不同；网关此前只读 `data`，导致 `message.part.updated` / `session.idle` 全部被静默丢弃，上游实际已生成完整回复，客户端却干等到超时。事件解析现在统一把 `properties` 归一化为 `data`，fake CodeArts server 也改为真实负载格式并补流式回归。
 - 事件归一化进一步兼容真实形态：支持 `{directory, payload:{type, properties}}` 信封（最多剥 3 层）、`{type, data}` / `{type, properties}` 混合、`data` 与 `properties` 同时存在；sessionID 现在会从顶层、`data/properties`、`info`、`part`、`message`、`session`、`request`、`form`、`params` 等多处递归提取（深度 4），避免因为换一层包装就整条流静默。补 envelope fake 回归与归一化/脱敏单元测试。
 - 提问挂起期间客户端空闲超时掐断连接导致“没法过几小时再回答”：审批/提问挂起时 opencode/zcode 渠道现在周期性发 SSE 心跳注释帧（`: keepalive`，客户端语义忽略但字节不断，间隔 = max(3s, min(15s, 提问上限/8))），`question_timeout_ms` 默认从 10 分钟放宽到 2 小时（config.yaml 里的显式值需手动调整或用新默认重建渠道）。挂起结束/任务终态时心跳停止。

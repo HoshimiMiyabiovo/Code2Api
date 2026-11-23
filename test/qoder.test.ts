@@ -30,6 +30,22 @@ interface Scenario {
 
 const fakeServerPath = join(import.meta.dirname, 'fake-qoder-server.cjs');
 
+/**
+ * fake server 用 writeFileSync 非原子落盘，全量测试高负载下
+ * 读到截断文件会 "Unexpected end of JSON input"；轮询到可解析为止。
+ */
+async function readState(harness: Harness, timeoutMs = 5000): Promise<any> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      return JSON.parse(readFileSync(harness.stateFile, 'utf8'));
+    } catch (error) {
+      if (Date.now() >= deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+}
+
 async function pollQuestions(
   harness: Harness,
   want: number,
@@ -190,7 +206,7 @@ test('qoder 任务级：非流式、流式、增量去重与 oneshot 收尾', as
     );
     assert.equal(oneshot.status, 200);
 
-    const state = JSON.parse(readFileSync(harness.stateFile, 'utf8'));
+    const state = await readState(harness);
     assert.deepEqual(state.prompts, ['hello-1', 'hello-2', 'hello-oneshot']);
     // open_session 携带 --model / --permission-mode / --include-partial-messages
     const open = state.sessionArgs[0];
@@ -200,8 +216,15 @@ test('qoder 任务级：非流式、流式、增量去重与 oneshot 收尾', as
       model: 'fake-qoder-provider/fake-model',
       via: 'open_session',
     });
-    // oneshot 收尾 daemon.close_session
-    assert.equal(state.closes.length, 1);
+    // oneshot 收尾 daemon.close_session（请求在 finally 中异步发出，轮询等待落盘）
+    let closes = 0;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const snapshot = await readState(harness);
+      closes = Array.isArray(snapshot.closes) ? snapshot.closes.length : 0;
+      if (closes >= 1) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(closes, 1);
   } finally {
     await harness.close();
   }
@@ -246,7 +269,7 @@ test('qoder 会话失效后重建并重放台账', async () => {
     });
     assert.equal(second.status, 200);
 
-    const state = JSON.parse(readFileSync(harness.stateFile, 'utf8'));
+    const state = await readState(harness);
     assert.equal(state.sessionArgs.length, 2, '应重新 open_session');
     assert.notEqual(state.sessionArgs[0].session_id, state.sessionArgs[1].session_id);
     assert.deepEqual(state.prompts, ['hello-1', 'hello-1\n\nhello-2']);
@@ -295,7 +318,7 @@ test('qoder 权限审批：面板提问 + 放行', async () => {
     const body = await response.json();
     assert.match(body.choices[0].message.content, /approved reply/);
 
-    const state = JSON.parse(readFileSync(harness.stateFile, 'utf8'));
+    const state = await readState(harness);
     assert.deepEqual(state.decisions, ['allow']);
   } finally {
     await harness.close();
@@ -332,7 +355,7 @@ test('qoder 权限审批：拒绝导致任务失败', async () => {
     const body = await response.json();
     assert.match(body.error.message, /permission denied/);
 
-    const state = JSON.parse(readFileSync(harness.stateFile, 'utf8'));
+    const state = await readState(harness);
     assert.deepEqual(state.decisions, ['deny']);
   } finally {
     await harness.close();
@@ -353,7 +376,7 @@ test('qoder bypass_permissions 模式自动放行', async () => {
     const body = await response.json();
     assert.equal(body.choices[0].message.content, 'auto allowed');
 
-    const state = JSON.parse(readFileSync(harness.stateFile, 'utf8'));
+    const state = await readState(harness);
     assert.deepEqual(state.decisions, ['allow']);
     const questions = await adminGet(harness, '/admin/api/questions');
     assert.equal((questions.questions ?? []).length, 0, '不应产生面板提问');
@@ -436,7 +459,7 @@ test('qoder 渠道 env 配置注入 CLI 子进程', async () => {
     });
     assert.equal(response.status, 200);
 
-    const data = JSON.parse(readFileSync(harness.stateFile, 'utf8'));
+    const data = await readState(harness);
     assert.equal(data.cliEnv.ELECTRON_RUN_AS_NODE, '1');
     assert.equal(data.cliEnv.QODER_PERSONAL_ACCESS_TOKEN, 'fake-pat-token');
     // 网关强制注入 daemon 模式标记

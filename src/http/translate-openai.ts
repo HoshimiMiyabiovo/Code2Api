@@ -126,6 +126,12 @@ function parseMessages(raw: unknown): CanonicalMessage[] {
         content: text ? [{ type: 'text', text }] : [],
       });
     } else {
+      if (role === 'assistant') {
+        // 部分客户端（DeepSeek/pi-ai 等）会用 reasoning_content 回放思考内容，
+        // 网关保留到 canonical，转发给需要 reasoning 的上游。
+        const reasoning = asString(item.reasoning_content) ?? asString(item.reasoning);
+        if (reasoning) parts.push({ type: 'thinking', text: reasoning });
+      }
       parts.push(...parseContent(item.content, true));
       if (role === 'assistant') {
         parts.push(...parseToolCalls(item.tool_calls));

@@ -17,6 +17,7 @@ import { log } from '../logger.js';
 import type { ModelEntry, ProviderRuntime, Registry } from '../providers/registry.js';
 import type { KeyRuntime } from './keys.js';
 import { isModelBlacklisted, resolveModelAlias } from './model-rules.js';
+import type { PrivacyGuard } from './privacy.js';
 
 interface Candidate {
   provider: ProviderRuntime;
@@ -158,6 +159,7 @@ export class Router {
     private readonly modelAliases: Record<string, string> = {},
     private readonly modelBlacklist: string[] = [],
     private readonly availability?: ProviderAvailability,
+    private readonly privacy?: PrivacyGuard,
   ) {}
 
   private resolveRequestedModel(modelId: string): string {
@@ -548,11 +550,17 @@ export class Router {
       signal,
       async (candidate, attempts) => {
         const started = performance.now();
-        const response = await candidate.provider.adapter.chat(
-          request,
+        const outbound = this.privacy
+          ? this.privacy.prepareRequest(request, candidate.provider.id, candidate.provider.type).request
+          : request;
+        const raw = await candidate.provider.adapter.chat(
+          outbound,
           candidate.model,
           { key: candidate.key.key, signal },
         );
+        const response = this.privacy
+          ? this.privacy.restoreResponse(raw, candidate.provider.id)
+          : raw;
         return {
           response,
           providerId: candidate.provider.id,
@@ -583,7 +591,10 @@ export class Router {
         const started = performance.now();
         let iterator: AsyncGenerator<StreamEvent, void, void> | null = null;
         try {
-          iterator = candidate.provider.adapter.chatStream(request, candidate.model, {
+          const outbound = this.privacy
+            ? this.privacy.prepareRequest(request, candidate.provider.id, candidate.provider.type).request
+            : request;
+          iterator = candidate.provider.adapter.chatStream(outbound, candidate.model, {
             key: candidate.key.key,
             signal,
           });
@@ -597,10 +608,13 @@ export class Router {
           const first = firstResult.value;
           const ttfbMs = Math.round(performance.now() - started);
           const committed = iterator;
-          const events = (async function* () {
+          const rawEvents = (async function* () {
             yield first;
             yield* committed;
           })();
+          const events = this.privacy
+            ? this.privacy.restoreEvents(rawEvents, candidate.provider.id)
+            : rawEvents;
           return {
             first,
             events,

@@ -12,7 +12,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node --disable-warning=ExperimentalWarning dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --disable-warning=ExperimentalWarning --import tsx --test test/*.test.ts"
+    "test": "node --env-file=test/.env.test --disable-warning=ExperimentalWarning --import tsx --test test/*.test.ts",
+    "migrate-secrets": "node --disable-warning=ExperimentalWarning --import tsx src/tools/migrate-secrets.ts"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.0",

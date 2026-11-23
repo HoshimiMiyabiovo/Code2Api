@@ -1156,6 +1156,76 @@ providers:
   }
 });
 
+test('opencode 自动发现：model_prefixes 按上游给对外名加前缀（订阅渠道）', async () => {
+  const fake = new FakeOpenCode();
+  fake.goModels = [
+    {
+      id: 'glm-9',
+      modelID: 'glm-9',
+      providerID: 'fake-go',
+      type: 'chat',
+      enabled: true,
+      status: 'active',
+      capabilities: { tools: true, input: ['text'] },
+      limit: { context: 1000000, output: 65536 },
+      cost: [{ input: 1, output: 3, cache: { read: 0.1, write: 0.2 } }],
+    },
+  ];
+  await fake.start();
+  const harness = await startGateway(`
+server:
+  port: 0
+admin:
+  token: test-admin
+storage:
+  path: __DB__
+providers:
+  - id: fake-oc-go
+    type: opencode
+    model_filter:
+      - "*free*"
+      - "fake-go/*"
+    model_prefixes:
+      "fake-go/*": "Go/"
+    priority: 10
+    base_url: ${fake.baseUrl}
+    password_env: C2A_TEST_OC_PASSWORD
+    auto_models: true
+    models: []
+`, fake.password);
+  try {
+    const models = await fetch(`${harness.base}/v1/models`).then((r) => r.json());
+    const ids = models.data.map((m: any) => m.id);
+    // 订阅渠道模型带前缀，原始裸名不应再出现。
+    assert.ok(ids.includes('Go/glm-9'), `应包含 Go/glm-9，实际 ${JSON.stringify(ids)}`);
+    assert.ok(!ids.includes('glm-9'), '原始裸名不应再出现');
+
+    const channels = await adminGet(harness, '/admin/api/channels');
+    const synced = channels.channels
+      .find((c: any) => c.id === 'fake-oc-go')
+      .models.find((m: any) => m.id === 'Go/glm-9');
+    assert.equal(synced.upstream, 'fake-go/glm-9');
+    assert.equal(synced.source, 'upstream');
+    assert.equal(synced.contextWindow, 1000000);
+
+    // 前缀名可正常路由执行。
+    const routed = await fetch(`${harness.base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'Go/glm-9',
+        messages: [{ role: 'user', content: 'go hello' }],
+      }),
+    });
+    assert.equal(routed.status, 200);
+    const body = await routed.json();
+    assert.equal(body.choices[0].message.content, 'fake reply: go hello');
+  } finally {
+    await harness.close();
+    await fake.close();
+  }
+});
+
 test('opencode 桥接：usage 分离——客户端=末步，记账=累加', async () => {
   const fake = new FakeOpenCode();
   // 模拟内部 agent 循环跑了两个 step：客户端应看到末步（当前对话规模），

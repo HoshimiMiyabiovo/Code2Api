@@ -35,7 +35,8 @@ export interface ModelListing {
   pricing?: ModelPricing;
 }
 
-function createAdapter(config: ProviderConfig, store: Store | undefined): ProviderAdapter {
+/** 按渠道配置构造适配器；探测端点用临时适配器探测草稿配置，用完即 close。 */
+export function createAdapter(config: ProviderConfig, store: Store | undefined): ProviderAdapter {
   switch (config.type) {
     case 'mock':
       return new MockAdapter();

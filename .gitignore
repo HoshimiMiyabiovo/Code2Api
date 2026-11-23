@@ -4,6 +4,7 @@ data/
 workspace/
 config/config.yaml
 config/config.yaml.bak
+config/config.yaml.bak-*
 config/config.yaml.tmp-*
 *.log
 .DS_Store

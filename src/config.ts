@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import YAML from 'yaml';
 import { z } from 'zod';
+import { tryDecryptSecret } from './core/secrets.js';
 
 export const APP_VERSION = '0.1.0';
 
@@ -44,6 +45,10 @@ export interface KeyConfig {
   key: string | null;
   keyEnv?: string;
   missingEnv?: string;
+  /** 加密落盘的密文（DPAPI 或 AES-GCM）；保存时原样写回，不解密后重写明文。 */
+  keyEnc?: string;
+  /** 密文解密失败原因（换机器/换用户/主密钥不匹配）。 */
+  keyError?: string;
 }
 
 export interface Timeouts {
@@ -96,6 +101,21 @@ export interface OpenAIProviderConfig extends ProviderBase {
   tokenLimitField: 'max_tokens' | 'max_completion_tokens';
   sendStreamOptions: boolean;
   extraHeaders: Record<string, string>;
+  /** 上游请求使用的 User-Agent；留空用 code2api/<version>。 */
+  userAgent?: string;
+  /** 模型目录地址覆盖（默认 `${baseUrl}/models`），用于 chat 与 models 路径不同的上游。 */
+  modelsUrl?: string;
+  /**
+   * 按会话注入的请求头名（如 x-opencode-session）。值优先取客户端会话 id，
+   * 缺省时用首条用户消息指纹生成，保证同一会话跨轮稳定。
+   */
+  sessionHeader?: string;
+  /**
+   * 自动发现模型的对外名前缀规则（glob → 前缀）：模式匹配裸 modelID 或
+   * providerID/modelID（与 model_filter 同语义），如 { "opencode-go/*": "Go/" }
+   * 把订阅渠道模型同步为 Go/<modelID>。upstream 保持原始名；手工 models 不受影响。
+   */
+  modelPrefixes?: Record<string, string>;
   timeouts: Timeouts;
   keys: KeyConfig[];
   /** 是否从上游 /models 拉取模型目录并合并。 */
@@ -116,6 +136,12 @@ export interface OpenCodeProviderConfig extends ProviderBase {
   codeartsDataDir?: string;
   /** 自动发现的模型 id 白名单（glob，如 *:free）；空数组 = 不过滤。手工 models 不受影响。 */
   modelFilter: string[];
+  /**
+   * 自动发现模型的对外名前缀规则（glob → 前缀）：模式匹配裸 modelID 或
+   * providerID/modelID（与 model_filter 同语义），如 { "opencode-go/*": "Go/" }
+   * 把订阅渠道模型同步为 Go/<modelID>。upstream 保持原始名；手工 models 不受影响。
+   */
+  modelPrefixes?: Record<string, string>;
   command: string;
   args: string[];
   /** spawn 时附加的环境变量（如 CodeArts 内核用 OPENCODE_DATA_DIR 隔离数据目录）。 */
@@ -214,6 +240,23 @@ export interface RetryPolicyConfig {
   maxTotalWaitMs: number;
 }
 
+/** 隐私守卫：出站令牌化 / 审计，入站还原。默认 off，不影响现有行为。 */
+export interface PrivacyConfig {
+  mode: 'off' | 'audit' | 'token';
+  /** 身份类检测（用户名 / uid / 邮箱 / 用户目录路径），误报风险高于凭据类，单独开关。 */
+  identity: boolean;
+  /** 精确匹配网关自身配置里的密钥 / 口令（零误报）。 */
+  protectConfigSecrets: boolean;
+  providers: {
+    /** 空 = 全部渠道生效。 */
+    include: string[];
+    exclude: string[];
+  };
+  /** 保管库条目保留天数（按最后使用时间）。 */
+  tokenRetentionDays: number;
+  maxVaultEntries: number;
+}
+
 export interface ResolvedConfig {
   server: {
     host: string;
@@ -225,6 +268,8 @@ export interface ResolvedConfig {
   };
   admin: {
     token: string;
+    /** admin.token_enc 解密失败时的原因（此时会退化为临时口令）。 */
+    tokenError?: string;
   };
   storage: {
     path: string;
@@ -241,6 +286,7 @@ export interface ResolvedConfig {
   };
   catalog: CatalogConfig;
   health: HealthConfig;
+  privacy: PrivacyConfig;
   providers: ProviderConfig[];
 }
 
@@ -292,10 +338,15 @@ const keySchema = z
     label: z.string().min(1).optional(),
     key: z.string().min(1).optional(),
     key_env: z.string().min(1).optional(),
+    key_enc: z.string().min(1).optional(),
   })
-  .refine((v) => Boolean(v.key) !== Boolean(v.key_env), {
-    message: 'key 与 key_env 必须二选一',
-  });
+  .refine(
+    (v) =>
+      [v.key, v.key_env, v.key_enc].filter((item) => Boolean(item)).length === 1,
+    {
+      message: 'key / key_env / key_enc 必须三选一',
+    },
+  );
 
 const timeoutsSchema = z
   .object({
@@ -341,6 +392,23 @@ const keepaliveSchema = z
   })
   .optional();
 
+const modelPrefixesSchema = z
+  .record(z.string())
+  .refine(
+    (value) =>
+      Object.entries(value).every(
+        ([pattern, prefix]) =>
+          pattern.trim().length > 0 &&
+          pattern.length <= 128 &&
+          !/\s/.test(pattern) &&
+          prefix.trim().length > 0 &&
+          prefix.length <= 64 &&
+          !/\s/.test(prefix),
+      ),
+    'model_prefixes 需为 glob → 前缀 的映射，键值均不能含空白',
+  )
+  .optional();
+
 const openAIProviderSchema = z.object({
   ...providerBase,
   type: z.literal('openai-compatible'),
@@ -349,6 +417,22 @@ const openAIProviderSchema = z.object({
   token_limit_field: z.enum(['max_tokens', 'max_completion_tokens']).default('max_tokens'),
   send_stream_options: z.boolean().default(true),
   extra_headers: z.record(z.string()).default({}),
+  user_agent: z
+    .string()
+    .trim()
+    .min(1)
+    .max(256)
+    .regex(/^[\x20-\x7e]+$/, 'user_agent 仅支持可见 ASCII')
+    .optional(),
+  models_url: z.string().url().max(2048).optional(),
+  session_header: z
+    .string()
+    .trim()
+    .min(1)
+    .max(64)
+    .regex(/^[A-Za-z0-9-]+$/, 'session_header 仅支持字母、数字和连字符')
+    .optional(),
+  model_prefixes: modelPrefixesSchema,
   timeouts: timeoutsSchema,
   keys: z.array(keySchema).default([]),
   sync_models: z.boolean().default(true),
@@ -364,6 +448,7 @@ const openCodeProviderSchema = z.object({
   flavor: z.enum(['opencode', 'kilo', 'codearts']).default('opencode'),
   codearts_data_dir: z.string().min(1).optional(),
   model_filter: z.array(z.string().min(1)).default([]),
+  model_prefixes: modelPrefixesSchema,
   models: z.array(modelSchema).min(0),
   command: z.string().min(1).default('opencode'),
   args: z.array(z.string()).default([]),
@@ -470,6 +555,22 @@ const retrySchema = z
   })
   .default({});
 
+const privacySchema = z
+  .object({
+    mode: z.enum(['off', 'audit', 'token']).default('off'),
+    identity: z.boolean().default(false),
+    protect_config_secrets: z.boolean().default(true),
+    providers: z
+      .object({
+        include: z.array(z.string().min(1)).default([]),
+        exclude: z.array(z.string().min(1)).default([]),
+      })
+      .default({}),
+    token_retention_days: z.number().int().min(1).max(3650).default(30),
+    max_vault_entries: z.number().int().min(10).max(100000).default(5000),
+  })
+  .default({});
+
 const configSchema = z.object({
   server: z
     .object({
@@ -484,8 +585,16 @@ const configSchema = z.object({
   admin: z
     .object({
       token: z.string().default(''),
+      token_env: z.string().min(1).optional(),
+      token_enc: z.string().min(1).optional(),
     })
-    .default({}),
+    .default({})
+    .refine(
+      (v) =>
+        [v.token, v.token_env, v.token_enc].filter((item) => Boolean(item))
+          .length <= 1,
+      { message: 'admin.token / token_env / token_enc 只能配置一个' },
+    ),
   storage: z
     .object({
       path: z.string().default('./data/gateway.db'),
@@ -521,6 +630,7 @@ const configSchema = z.object({
       timeout_ms: z.number().int().positive().default(10000),
     })
     .default({}),
+  privacy: privacySchema,
   providers: z.array(providerSchema).min(1),
 });
 
@@ -569,8 +679,43 @@ function resolveKeys(
       }
       return { label, key: value, keyEnv: k.key_env };
     }
+    if (k.key_enc) {
+      const decrypted = tryDecryptSecret(k.key_enc);
+      if (decrypted.value === undefined) {
+        return { label, key: null, keyEnc: k.key_enc, keyError: decrypted.error };
+      }
+      return { label, key: decrypted.value, keyEnc: k.key_enc };
+    }
+    // 兼容历史明文 key；新写入的密钥一律走 key_enc 或 key_env。
     return { label, key: k.key ?? null };
   });
+}
+
+function resolveAdminToken(cfg: {
+  admin: { token: string; token_env?: string; token_enc?: string };
+}): { token: string; tokenError?: string } {
+  if (cfg.admin.token_enc) {
+    const decrypted = tryDecryptSecret(cfg.admin.token_enc);
+    if (decrypted.value === undefined) {
+      return { token: '', tokenError: decrypted.error };
+    }
+    return { token: decrypted.value };
+  }
+  if (cfg.admin.token_env) {
+    return { token: process.env[cfg.admin.token_env] ?? '' };
+  }
+  return { token: cfg.admin.token };
+}
+
+/** 规范化 model_prefixes：去除键值首尾空白，丢弃空项；全空时返回 undefined。 */
+function normalizeModelPrefixes(
+  raw: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (!raw) return undefined;
+  const entries = Object.entries(raw)
+    .map(([pattern, prefix]) => [pattern.trim(), prefix.trim()] as const)
+    .filter(([pattern, prefix]) => pattern.length > 0 && prefix.length > 0);
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
 export function parseConfig(raw: unknown): ResolvedConfig {
@@ -600,6 +745,7 @@ export function parseConfig(raw: unknown): ResolvedConfig {
         flavor: p.flavor,
         codeartsDataDir: p.codearts_data_dir,
         modelFilter: p.model_filter,
+        modelPrefixes: normalizeModelPrefixes(p.model_prefixes),
         command: p.command,
         args: p.args,
         env: p.env,
@@ -672,6 +818,10 @@ export function parseConfig(raw: unknown): ResolvedConfig {
       tokenLimitField: p.token_limit_field,
       sendStreamOptions: p.send_stream_options,
       extraHeaders: p.extra_headers,
+      userAgent: p.user_agent,
+      modelsUrl: p.models_url?.replace(/\/+$/, ''),
+      sessionHeader: p.session_header,
+      modelPrefixes: normalizeModelPrefixes(p.model_prefixes),
       timeouts: {
         connectMs: p.timeouts.connect_ms,
         ttfbMs: p.timeouts.ttfb_ms,
@@ -728,7 +878,7 @@ export function parseConfig(raw: unknown): ResolvedConfig {
       maxConcurrency: cfg.server.max_concurrency,
       maxQueueWaitMs: cfg.server.max_queue_wait_ms,
     },
-    admin: { token: cfg.admin.token },
+    admin: resolveAdminToken(cfg),
     storage: { path: cfg.storage.path },
     routing: {
       maxAttempts: cfg.routing.max_attempts,
@@ -766,6 +916,17 @@ export function parseConfig(raw: unknown): ResolvedConfig {
       enabled: cfg.health.enabled,
       intervalMs: cfg.health.interval_ms,
       timeoutMs: cfg.health.timeout_ms,
+    },
+    privacy: {
+      mode: cfg.privacy.mode,
+      identity: cfg.privacy.identity,
+      protectConfigSecrets: cfg.privacy.protect_config_secrets,
+      providers: {
+        include: [...cfg.privacy.providers.include],
+        exclude: [...cfg.privacy.providers.exclude],
+      },
+      tokenRetentionDays: cfg.privacy.token_retention_days,
+      maxVaultEntries: cfg.privacy.max_vault_entries,
     },
     providers,
   };

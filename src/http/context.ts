@@ -2,6 +2,7 @@ import type { ResolvedConfig } from '../config.js';
 import type { ConcurrencyLimiter } from '../core/limiter.js';
 import type { ModelCatalog } from '../core/model-catalog.js';
 import type { PoolSupervisor } from '../core/pool-supervisor.js';
+import type { PrivacyGuard } from '../core/privacy.js';
 import type { Router } from '../core/router.js';
 import type { Registry } from '../providers/registry.js';
 import type { Store } from '../store/db.js';
@@ -14,6 +15,7 @@ export interface GatewayContext {
   supervisor: PoolSupervisor;
   limiter: ConcurrencyLimiter;
   store: Store;
+  privacy: PrivacyGuard;
   startedAt: number;
   adminToken: string;
   configPath?: string;

@@ -84,6 +84,77 @@
         </div>
       </section>
 
+      <section class="panel" id="privacy-panel">
+        <div class="panel-head">
+          <h2>隐私守卫</h2>
+          <span class="muted">出站把密钥 / 口令 / 身份值换成占位符，真值加密存本地；返回客户端前自动还原</span>
+          <div class="panel-actions">
+            <span id="privacy-note" class="muted"></span>
+            <button id="privacy-save" class="primary">保存隐私设置</button>
+          </div>
+        </div>
+        <div class="form-grid" id="privacy-form">
+          <label>模式
+            <select id="privacy-mode">
+              <option value="off">关闭（不检测）</option>
+              <option value="audit">仅审计（检测 + 记录，不替换）</option>
+              <option value="token">令牌化（替换 + 还原，推荐）</option>
+            </select>
+          </label>
+          <label>保管库保留天数
+            <input id="privacy-retention" type="number" min="1" max="3650" step="1">
+          </label>
+          <label class="check-row"><input id="privacy-identity" type="checkbox">身份类检测（用户名 / uid / 邮箱 / 用户目录）</label>
+          <label class="check-row"><input id="privacy-config-secrets" type="checkbox">精确保护网关自身配置的密钥 / 口令</label>
+          <label>生效渠道（逗号分隔，留空 = 全部直连渠道）
+            <input id="privacy-include" type="text" placeholder="如 openai-main, go">
+          </label>
+          <label>排除渠道（逗号分隔）
+            <input id="privacy-exclude" type="text" placeholder="如 experimental">
+          </label>
+          <label>保管库容量上限
+            <input id="privacy-max-vault" type="number" min="10" max="100000" step="10">
+          </label>
+          <div class="span-2">
+            <div class="muted" id="privacy-status">—</div>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>渠道</th>
+                <th>方向</th>
+                <th>类别</th>
+                <th>动作</th>
+                <th class="num">次数</th>
+                <th>样本（掩码）</th>
+              </tr>
+            </thead>
+            <tbody id="privacy-events-body"></tbody>
+          </table>
+        </div>
+        <div class="panel-head">
+          <h2>本地保管库</h2>
+          <span class="muted" id="privacy-vault-note">占位符 → 加密真值，明文不出本机</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>占位符</th>
+                <th>类别</th>
+                <th>真值（掩码）</th>
+                <th class="num">命中</th>
+                <th>最近使用</th>
+              </tr>
+            </thead>
+            <tbody id="privacy-vault-body"></tbody>
+          </table>
+        </div>
+      </section>
+
       <section class="panel" id="questions-panel" hidden>
         <div class="panel-head">
           <h2>待处理提问</h2>
@@ -222,6 +293,9 @@
           <input id="ch-priority" type="number" step="1" value="100">
         </label>
         <label class="check-row"><input id="ch-enabled" type="checkbox" checked>启用该渠道</label>
+        <label id="ch-model-prefixes-row" class="span-2" hidden>模型名前缀规则（每行 模式=前缀；按上游名匹配自动发现的模型，如 opencode-go/*=Go/；手工模型与 upstream 不受影响）
+          <textarea id="ch-model-prefixes" rows="2" placeholder="opencode-go/*=Go/"></textarea>
+        </label>
         <label class="span-2 openai-only">Base URL
           <input id="ch-base-url" autocomplete="off" placeholder="https://api.example.com/v1">
         </label>
@@ -238,6 +312,19 @@
           </select>
         </label>
         <label class="check-row span-2 openai-only"><input id="ch-stream-options" type="checkbox" checked>向上游请求 stream_options.include_usage（用量统计更准确）</label>
+        <label class="span-2 openai-only">模型列表 URL（可选；留空 = Base URL + /models）
+          <input id="ch-models-url" autocomplete="off" placeholder="https://opencode.ai/inference/go/v1/models">
+        </label>
+        <label class="openai-only">上游 User-Agent（留空 = code2api/版本）
+          <input id="ch-user-agent" autocomplete="off" placeholder="my-coding-agent/1.0">
+        </label>
+        <label class="openai-only">会话头名称（可选；按会话注入稳定 ID）
+          <input id="ch-session-header" autocomplete="off" placeholder="x-opencode-session">
+        </label>
+        <div class="span-2 openai-only section-actions">
+          <button type="button" class="mini" id="ch-opencode-go-preset">填入 OpenCode Go 预设</button>
+          <span class="muted">OpenCode Go：Chat 路径 /openai/v1，模型目录 /v1/models，必须带稳定会话 ID</span>
+        </div>
         <label class="cli-only">可执行文件
           <input id="ch-command" autocomplete="off" placeholder="node 或 opencode">
         </label>
@@ -342,12 +429,17 @@
       <div class="form-section">
         <div class="section-head">
           <h3>模型 <span id="model-count" class="muted"></span></h3>
-          <button id="add-model-btn">添加模型</button>
+          <div class="section-actions">
+            <button id="probe-models-btn" type="button" hidden>探测上游</button>
+            <button id="add-model-btn" type="button">添加模型</button>
+          </div>
         </div>
         <div class="model-picker-row">
           <select id="model-picker"></select>
           <button id="model-remove-btn" class="mini danger" type="button">移除</button>
         </div>
+        <p id="probe-status" class="muted probe-status" hidden></p>
+        <div id="probe-results" hidden></div>
         <div id="models-editor" class="stack"></div>
       </div>
 
@@ -368,6 +460,7 @@
     <option value="xhigh"></option>
     <option value="max"></option>
   </datalist>
+  <datalist id="upstream-options"></datalist>
   <script src="/admin/app.js" defer></script>
 </body>
 </html>

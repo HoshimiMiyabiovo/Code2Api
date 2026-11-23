@@ -26,8 +26,13 @@ async function main(): Promise<void> {
     log.info(`Code2Api v${APP_VERSION} 已启动: ${address}`);
     log.info(`管理面板: ${address}/admin`);
     if (!config.admin.token) {
+      if (config.admin.tokenError) {
+        log.warn(`admin.token 解密失败：${config.admin.tokenError}`);
+      }
       log.warn(`未配置 admin.token，本次临时口令: ${ctx.adminToken}`);
-      log.warn('如需固定口令，请填写 config/config.yaml 的 admin.token 后重启。');
+      log.warn(
+        '如需固定口令，请填写 config/config.yaml 的 admin.token / token_env / token_enc 后重启。',
+      );
     }
     for (const provider of ctx.registry.providers) {
       const models = provider.models.map((model) => model.id).join(', ');

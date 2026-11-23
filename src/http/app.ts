@@ -4,6 +4,8 @@ import cors from '@fastify/cors';
 import type { ResolvedConfig } from '../config.js';
 import { ConcurrencyLimiter } from '../core/limiter.js';
 import { ModelCatalog } from '../core/model-catalog.js';
+import { PrivacyGuard } from '../core/privacy.js';
+import { encryptSecret, tryDecryptSecret } from '../core/secrets.js';
 import { PoolSupervisor } from '../core/pool-supervisor.js';
 import { Router } from '../core/router.js';
 import { GatewayError } from '../errors.js';
@@ -30,6 +32,29 @@ export interface Gateway {
 
 export interface GatewayOptions {
   configPath?: string;
+}
+
+/**
+ * 隐私守卫 HMAC 密钥：首次生成后加密存进 privacy_meta，之后复用。
+ * 占位符 = HMAC(真值)，密钥稳定才能保证同一真值跨重启映射同一占位符（prompt cache 友好）。
+ * 加密不可用时退回进程内随机密钥（此时 token 模式本就降级 audit，占位符不会外发）。
+ */
+function loadOrCreatePrivacyHmacKey(store: Store): Buffer {
+  const stored = store.getPrivacyMeta('hmac_key');
+  if (stored) {
+    const decrypted = tryDecryptSecret(stored);
+    if (decrypted.value !== undefined) {
+      return Buffer.from(decrypted.value, 'base64url');
+    }
+    log.warn(`隐私守卫：HMAC 密钥解密失败（${decrypted.error}），重新生成；旧占位符将无法还原`);
+  }
+  const key = randomBytes(32);
+  try {
+    store.setPrivacyMeta('hmac_key', encryptSecret(key.toString('base64url')));
+  } catch (error) {
+    log.warn(`隐私守卫：HMAC 密钥无法加密保存（${(error as Error).message}），仅本进程有效`);
+  }
+  return key;
 }
 
 export async function createGateway(
@@ -64,10 +89,19 @@ export async function createGateway(
 
   const registry = new Registry(config, store);
   const supervisor = new PoolSupervisor();
+  // 隐私守卫的 HMAC 密钥持久化在库里（加密），保证占位符跨重启稳定、不打散 prompt cache。
+  const privacyHmacKey = loadOrCreatePrivacyHmacKey(store);
   const limiter = new ConcurrencyLimiter(
     config.server.maxConcurrency,
     config.server.maxQueueWaitMs,
   );
+  // 构造期 ctx 尚未初始化（TDZ），用可变持有者提供最新配置；热加载时同步更新。
+  let privacyConfigRef: ResolvedConfig = config;
+  const privacy = new PrivacyGuard({
+    store,
+    getConfig: () => privacyConfigRef,
+    hmacKey: privacyHmacKey,
+  });
   const router = new Router(
     registry,
     config.routing.maxAttempts,
@@ -77,6 +111,7 @@ export async function createGateway(
     config.routing.modelAliases,
     config.routing.modelBlacklist,
     supervisor,
+    privacy,
   );
   const catalog = new ModelCatalog();
 
@@ -88,6 +123,7 @@ export async function createGateway(
     supervisor,
     limiter,
     store,
+    privacy,
     startedAt: Date.now(),
     adminToken,
     configPath: options.configPath,
@@ -103,10 +139,13 @@ export async function createGateway(
         next.routing.modelAliases,
         next.routing.modelBlacklist,
         supervisor,
+        privacy,
       );
       ctx.config = next;
+      privacyConfigRef = next;
       ctx.registry = nextRegistry;
       ctx.router = nextRouter;
+      ctx.privacy.refreshSecrets();
       ctx.catalog.stop();
       ctx.catalog.start(nextRegistry, next.catalog);
       void ctx.catalog.sync(nextRegistry, next.catalog);
@@ -117,6 +156,7 @@ export async function createGateway(
     },
     applyRetryConfig: (next: ResolvedConfig) => {
       ctx.config = next;
+      privacyConfigRef = next;
       ctx.router = new Router(
         ctx.registry,
         next.routing.maxAttempts,
@@ -126,6 +166,7 @@ export async function createGateway(
         next.routing.modelAliases,
         next.routing.modelBlacklist,
         supervisor,
+        privacy,
       );
       log.info('重试配置已热加载');
     },

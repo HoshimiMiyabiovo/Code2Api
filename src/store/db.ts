@@ -198,6 +198,33 @@ export interface RecentRequest {
   attempts: number;
 }
 
+/** 隐私保管库条目：占位符 → 加密真值。明文永不落库。 */
+export interface PrivacyVaultRow {
+  placeholder: string;
+  category: string;
+  valueEnc: string;
+  masked: string;
+  hits: number;
+  createdAt: number;
+  lastUsedAt: number;
+}
+
+export interface PrivacyEventRecord {
+  ts: number;
+  provider: string;
+  direction: 'outbound' | 'inbound';
+  category: string;
+  action: 'detected' | 'tokenized' | 'restored';
+  count: number;
+  masked?: string | null;
+  sessionId?: string | null;
+  model?: string | null;
+}
+
+export interface PrivacyEventRow extends PrivacyEventRecord {
+  id: number;
+}
+
 export interface RecentRequestQuery {
   limit?: number;
   offset?: number;
@@ -395,6 +422,33 @@ CREATE TABLE IF NOT EXISTS response_store (
   messages_json TEXT NOT NULL,
   output_json TEXT
 );
+CREATE TABLE IF NOT EXISTS privacy_vault (
+  placeholder TEXT PRIMARY KEY,
+  category TEXT NOT NULL,
+  value_enc TEXT NOT NULL,
+  masked TEXT NOT NULL,
+  hits INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  last_used_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_privacy_vault_used ON privacy_vault(last_used_at);
+CREATE TABLE IF NOT EXISTS privacy_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  provider TEXT NOT NULL,
+  direction TEXT NOT NULL,
+  category TEXT NOT NULL,
+  action TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 1,
+  masked TEXT,
+  session_id TEXT,
+  model TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_privacy_events_ts ON privacy_events(ts);
+CREATE TABLE IF NOT EXISTS privacy_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 `;
 
 const INSERT_SQL = `
@@ -501,6 +555,156 @@ export class Store {
       WHERE ts >= ?
       GROUP BY provider, key_label
     `);
+  }
+
+  getPrivacyMeta(key: string): string | null {
+    const row = this.db.prepare('SELECT value FROM privacy_meta WHERE key = ?').get(key) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? String(row.value) : null;
+  }
+
+  setPrivacyMeta(key: string, value: string): void {
+    this.db
+      .prepare(
+        'INSERT INTO privacy_meta (key, value) VALUES (?, ?) ' +
+          'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+      )
+      .run(key, value);
+  }
+
+  upsertPrivacyVault(entry: {
+    placeholder: string;
+    category: string;
+    valueEnc: string;
+    masked: string;
+    now: number;
+  }): void {
+    this.db
+      .prepare(
+        'INSERT INTO privacy_vault (placeholder, category, value_enc, masked, hits, created_at, last_used_at) ' +
+          'VALUES (?, ?, ?, ?, 1, ?, ?) ' +
+          'ON CONFLICT(placeholder) DO UPDATE SET hits = hits + 1, last_used_at = excluded.last_used_at, ' +
+          'value_enc = excluded.value_enc, masked = excluded.masked',
+      )
+      .run(entry.placeholder, entry.category, entry.valueEnc, entry.masked, entry.now, entry.now);
+  }
+
+  getPrivacyVault(placeholder: string): PrivacyVaultRow | null {
+    const row = this.db
+      .prepare('SELECT * FROM privacy_vault WHERE placeholder = ?')
+      .get(placeholder) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    this.db
+      .prepare('UPDATE privacy_vault SET last_used_at = ? WHERE placeholder = ?')
+      .run(Date.now(), placeholder);
+    return {
+      placeholder: String(row.placeholder),
+      category: String(row.category),
+      valueEnc: String(row.value_enc),
+      masked: String(row.masked),
+      hits: num(row.hits),
+      createdAt: num(row.created_at),
+      lastUsedAt: num(row.last_used_at),
+    };
+  }
+
+  countPrivacyVault(): number {
+    const row = this.db.prepare('SELECT COUNT(*) AS n FROM privacy_vault').get() as
+      | Record<string, unknown>
+      | undefined;
+    return num(row?.n);
+  }
+
+  listPrivacyVault(limit: number): PrivacyVaultRow[] {
+    const rows = this.db
+      .prepare('SELECT * FROM privacy_vault ORDER BY last_used_at DESC LIMIT ?')
+      .all(Math.max(1, Math.min(limit, 500))) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      placeholder: String(row.placeholder),
+      category: String(row.category),
+      valueEnc: String(row.value_enc),
+      masked: String(row.masked),
+      hits: num(row.hits),
+      createdAt: num(row.created_at),
+      lastUsedAt: num(row.last_used_at),
+    }));
+  }
+
+  /** 按保留期与容量上限修剪保管库（LRU）。只在写入新条目时触发。 */
+  prunePrivacyVault(options: { maxEntries: number; olderThanMs: number }): void {
+    this.db.prepare('DELETE FROM privacy_vault WHERE last_used_at < ?').run(options.olderThanMs);
+    this.db
+      .prepare(
+        'DELETE FROM privacy_vault WHERE placeholder NOT IN ' +
+          '(SELECT placeholder FROM privacy_vault ORDER BY last_used_at DESC LIMIT ?)',
+      )
+      .run(options.maxEntries);
+  }
+
+  recordPrivacyEvent(record: PrivacyEventRecord): void {
+    this.db
+      .prepare(
+        'INSERT INTO privacy_events (ts, provider, direction, category, action, count, masked, session_id, model) ' +
+          'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        record.ts,
+        record.provider,
+        record.direction,
+        record.category,
+        record.action,
+        record.count,
+        record.masked ?? null,
+        record.sessionId ?? null,
+        record.model ?? null,
+      );
+  }
+
+  recentPrivacyEvents(options: { sinceMs: number; limit: number }): PrivacyEventRow[] {
+    const rows = this.db
+      .prepare('SELECT * FROM privacy_events WHERE ts >= ? ORDER BY ts DESC, id DESC LIMIT ?')
+      .all(options.sinceMs, Math.max(1, Math.min(options.limit, 500))) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: num(row.id),
+      ts: num(row.ts),
+      provider: String(row.provider),
+      direction: String(row.direction) as 'outbound' | 'inbound',
+      category: String(row.category),
+      action: String(row.action) as 'detected' | 'tokenized' | 'restored',
+      count: num(row.count),
+      masked: nullableStr(row.masked),
+      sessionId: nullableStr(row.session_id),
+      model: nullableStr(row.model),
+    }));
+  }
+
+  privacyEventTotals(sinceMs: number): {
+    detected: number;
+    tokenized: number;
+    restored: number;
+    byCategory: Array<{ category: string; count: number }>;
+  } {
+    const row = this.db
+      .prepare(
+        "SELECT COALESCE(SUM(CASE WHEN action = 'detected' THEN count ELSE 0 END), 0) AS detected, " +
+          "COALESCE(SUM(CASE WHEN action = 'tokenized' THEN count ELSE 0 END), 0) AS tokenized, " +
+          "COALESCE(SUM(CASE WHEN action = 'restored' THEN count ELSE 0 END), 0) AS restored " +
+          'FROM privacy_events WHERE ts >= ?',
+      )
+      .get(sinceMs) as Record<string, unknown> | undefined;
+    const cats = this.db
+      .prepare(
+        "SELECT category, SUM(count) AS n FROM privacy_events WHERE ts >= ? AND action != 'restored' " +
+          'GROUP BY category ORDER BY n DESC',
+      )
+      .all(sinceMs) as Array<Record<string, unknown>>;
+    return {
+      detected: num(row?.detected),
+      tokenized: num(row?.tokenized),
+      restored: num(row?.restored),
+      byCategory: cats.map((c) => ({ category: String(c.category), count: num(c.n) })),
+    };
   }
 
   recordRequest(record: RequestRecord): void {
