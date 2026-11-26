@@ -198,6 +198,26 @@ select {
   font-size: 12px;
 }
 
+/* 校验失败时短暂标红对应输入框（saveChannel → highlightInvalidField） */
+.input-invalid {
+  outline: 2px solid var(--bad) !important;
+  outline-offset: -1px;
+  animation: input-invalid-shake 0.18s 2;
+}
+
+@keyframes input-invalid-shake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  25% {
+    transform: translateX(-3px);
+  }
+  75% {
+    transform: translateX(3px);
+  }
+}
+
 .hint {
   margin: 0;
   color: var(--muted);
@@ -941,6 +961,37 @@ button:disabled {
 
 .question-actions .danger {
   color: var(--bad);
+}
+
+.question-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+}
+
+.question-item:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+.question-item .q-custom-text {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  border-radius: 7px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+}
+
+.question-item .caps-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text);
+  font-size: 13px;
 }
 
 @media (max-width: 720px) {

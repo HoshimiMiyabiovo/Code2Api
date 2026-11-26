@@ -170,6 +170,7 @@
             <span id="channels-note" class="muted"></span>
             <button id="probe-btn" class="ghost">立即探活</button>
             <button id="keepalive-btn" class="ghost">触发保活</button>
+            <button id="clear-cooldowns-btn" class="ghost">一键清空冷却</button>
             <button id="export-btn" class="ghost">导出数据</button>
             <button id="add-channel-btn">新增渠道</button>
           </div>
@@ -312,8 +313,15 @@
           </select>
         </label>
         <label class="check-row span-2 openai-only"><input id="ch-stream-options" type="checkbox" checked>向上游请求 stream_options.include_usage（用量统计更准确）</label>
+        <label class="check-row span-2 openai-only"><input id="ch-free-only" type="checkbox">只同步上游显式标记 isFree:true 的模型（手工模型不受影响）</label>
         <label class="span-2 openai-only">模型列表 URL（可选；留空 = Base URL + /models）
           <input id="ch-models-url" autocomplete="off" placeholder="https://opencode.ai/inference/go/v1/models">
+        </label>
+        <label class="openai-only">推理强度字段路径（可选；留空 = reasoning_effort）
+          <input id="ch-reasoning-field" autocomplete="off" placeholder="reasoning.effort">
+        </label>
+        <label class="openai-only">关闭思考字段路径（可选；disabled/none/off 时写 false）
+          <input id="ch-reasoning-off-field" autocomplete="off" placeholder="reasoning.enabled">
         </label>
         <label class="openai-only">上游 User-Agent（留空 = code2api/版本）
           <input id="ch-user-agent" autocomplete="off" placeholder="my-coding-agent/1.0">
@@ -323,7 +331,8 @@
         </label>
         <div class="span-2 openai-only section-actions">
           <button type="button" class="mini" id="ch-opencode-go-preset">填入 OpenCode Go 预设</button>
-          <span class="muted">OpenCode Go：Chat 路径 /openai/v1，模型目录 /v1/models，必须带稳定会话 ID</span>
+          <button type="button" class="mini" id="ch-kilo-preset">填入 Kilo 免费池预设</button>
+          <span class="muted">Kilo 免密免费池：prompt 可能被记录，请勿发送敏感内容</span>
         </div>
         <label class="cli-only">可执行文件
           <input id="ch-command" autocomplete="off" placeholder="node 或 opencode">
@@ -403,6 +412,7 @@
         <label class="qoder-only span-2">CLI 环境变量（每行 KEY=VALUE；注入 CLI 子进程）
           <textarea id="ch-qoder-env" rows="3" placeholder="ELECTRON_RUN_AS_NODE=1"></textarea>
         </label>
+        <div class="qoder-only span-2 muted">IDE 登录态与 Qoder CLI 登录态分开：qodercli 认证要求本机 CLI 已登录（~/.qoder/qoder-cli-credentials.json）；也可在启动网关前设置 QODER_PERSONAL_ACCESS_TOKEN 环境变量，勿在此填写明文。</div>
         <label class="qoder-only">会话权限模式
           <select id="ch-qoder-mode">
             <option value="auto">auto（IDE 同款自动审批）</option>
@@ -413,6 +423,10 @@
             <option value="bypass_permissions">bypass_permissions（全部自动放行）</option>
           </select>
         </label>
+        <div class="span-2 qoder-only section-actions">
+          <button type="button" class="mini" id="ch-qoder-detect">检测本机 Qoder 并填入</button>
+          <span class="muted">扫描本机安装目录，自动填 Qoder.exe / worker runtime / ELECTRON_RUN_AS_NODE；模型 ID 填 Qoder 模型 key（如 dfmodel），上游可留空（默认用模型 ID），要指定 provider 时填 providerId/modelKey</span>
+        </div>
       </div>
 
       <div class="form-section openai-only">

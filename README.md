@@ -52,7 +52,8 @@ start.cmd
 
 真实配置为 `config/config.yaml`，已被 `.gitignore` 排除；模板见 `config/config.example.yaml`。
 
-- 密钥优先使用 `key_env` 引用环境变量，例如 `STATION_A_KEY`；也支持明文 `key`，但不推荐。
+- 密钥默认加密落盘：面板填写的渠道密钥保存为 `key_enc`（Windows 用当前用户的 DPAPI；设置 `CODE2API_MASTER_KEY` 时用 AES-256-GCM），面板只显示掩码，API 不回传明文。也支持 `key_env` 引用环境变量；历史明文 `key` 仍可读取，面板保存时会自动转成密文，批量迁移用 `npm run migrate-secrets`（自动备份原文件）。
+- `admin.token` 同样支持 `token_env` / `token_enc`；换 Windows 用户或换机后 DPAPI 密文无法解密，需要重新填写密钥（或改用 `CODE2API_MASTER_KEY` 的 AES 方案）。
 - 渠道、密钥、模型都可在面板增删改，保存后热加载，无需手改 YAML。
 - `workspace_roots` 是 opencode 渠道允许的请求级工作区根目录（绝对路径）；目标目录必须已存在。
 - `admin.token` 为面板口令；留空时启动会生成临时口令并打印到日志。

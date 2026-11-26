@@ -6,6 +6,36 @@
 
 const fs = require('node:fs');
 
+// daemon.get_models 的默认目录（形状对齐 runtime 1.1.86 的 YCe 映射）
+const DEFAULT_CATALOG = [
+  {
+    modelId: 'fake-qoder-model',
+    value: 'fake-qoder-model',
+    displayName: 'Fake Qoder 主模型',
+    description: 'fake catalog entry',
+    maxInputTokens: 200000,
+    maxOutputTokens: 32000,
+    isReasoning: true,
+    isVl: true,
+    isDefault: true,
+    isEnabled: true,
+    efforts: ['low', 'medium', 'high'],
+  },
+  {
+    modelId: 'fake-qoder-eco',
+    value: 'fake-qoder-eco',
+    displayName: 'Fake Qoder Eco',
+    maxInputTokens: 128000,
+    maxOutputTokens: 8192,
+    isEnabled: true,
+  },
+  {
+    modelId: 'fake-qoder-hidden',
+    displayName: 'Fake Qoder Hidden',
+    isEnabled: false,
+  },
+];
+
 const scenarioPath = process.argv[2] || '';
 const scenario = scenarioPath
   ? JSON.parse(fs.readFileSync(scenarioPath, 'utf8'))
@@ -17,6 +47,7 @@ const state = {
   models: [],
   sessionArgs: [],
   closes: [],
+  auth: [],
   // 记录网关注入到 CLI 子进程的环境变量（验证渠道 env 配置确实生效）
   cliEnv: {
     QODER_AGENT_SDK_DAEMON: process.env.QODER_AGENT_SDK_DAEMON ?? null,
@@ -38,17 +69,26 @@ function send(frame) {
   process.stdout.write(`${JSON.stringify(frame)}\n`);
 }
 
-function respond(requestId, result) {
+// 真实 daemon 的 session id 放在 control_response 信封顶层（writeSuccess），
+// payload 里通常没有；fake 必须按真实形状回包，否则会把网关的解析 bug 盖住。
+function respond(requestId, result, sessionId) {
   send({
     type: 'control_response',
-    response: { subtype: 'success', request_id: requestId, response: result ?? {} },
+    ...(typeof sessionId === 'string' && sessionId ? { session_id: sessionId } : {}),
+    response: {
+      subtype: 'success',
+      request_id: requestId,
+      ...(result === undefined ? {} : { response: result }),
+    },
   });
 }
 
+// 真实 runtime 对 error 做 strict zod 校验：必须是字符串。
+// 这里也严格一点，防止网关再回 { message } 对象。
 function respondError(requestId, message) {
   send({
     type: 'control_response',
-    response: { subtype: 'error', request_id: requestId, error: { message } },
+    response: { subtype: 'error', request_id: requestId, error: String(message) },
   });
 }
 
@@ -87,7 +127,7 @@ function askPermission(sessionId, toolName) {
       request_id: requestId,
       session_id: sessionId,
       request: {
-        type: 'can_use_tool',
+        subtype: 'can_use_tool',
         tool_name: toolName,
         input: { command: 'ls' },
         tool_use_id: `tool_${seq}`,
@@ -202,12 +242,8 @@ function handleLine(line) {
 
 async function handleRequest(requestId, request, sessionId) {
   try {
-    const type = request.type;
+    const type = request.subtype || request.type;
     if (type === 'daemon.initialize') {
-      if (scenario.authError) {
-        respondError(requestId, 'auth failed: not logged in (no PAT, no cli login state)');
-        return;
-      }
       if (request.daemon_protocol_version !== 2) {
         respondError(requestId, `unsupported daemon_protocol_version: ${request.daemon_protocol_version}`);
         return;
@@ -219,6 +255,17 @@ async function handleRequest(requestId, request, sessionId) {
         daemon_version: '1.1.86-hotfix.17',
         capabilities: ['multi_session_v2', 'session_delete_v1', 'daemon_queries_v1'],
       });
+      return;
+    }
+    if (type === 'daemon.authenticate') {
+      // 真实 daemon.authenticate 收 { auth: {type, ...} }，返回 {authenticated:boolean}。
+      state.auth.push(request.auth ?? null);
+      flushState();
+      if (scenario.authError) {
+        respondError(requestId, 'auth failed: not logged in (no PAT, no cli login state)');
+        return;
+      }
+      respond(requestId, { authenticated: true });
       return;
     }
     if (type === 'daemon.open_session') {
@@ -238,13 +285,17 @@ async function handleRequest(requestId, request, sessionId) {
         state.models.push({ model: args[modelIndex + 1], via: 'open_session' });
       }
       flushState();
-      respond(requestId, { session_id: sid });
+      // 与真实 daemon 一致：session id 走 control_response 信封顶层。
+      respond(requestId, {}, sid);
       return;
     }
     if (type === 'daemon.list_sessions') {
       // dropSessionOnList：模拟 daemon 重启后会话丢失，回归网关“重建会话+重放账本”
-      const ids = scenario.dropSessionOnList ? [] : [...sessions];
-      respond(requestId, { sessions: ids });
+      // 真实字段是 local_session_id，不是 session_id/id。
+      const list = scenario.dropSessionOnList ? [] : [...sessions];
+      respond(requestId, {
+        sessions: list.map((sid) => ({ local_session_id: sid, state: 'ready' })),
+      });
       return;
     }
     if (type === 'initialize') {
@@ -258,14 +309,28 @@ async function handleRequest(requestId, request, sessionId) {
       respond(requestId, {});
       return;
     }
+    if (type === 'daemon.get_models') {
+      // 真实 daemon 返回 {models:[...]}；fetchStrategy 缺省 = auto（可用本地缓存）。
+      state.modelsQuery = request;
+      flushState();
+      respond(requestId, { models: scenario.catalog ?? DEFAULT_CATALOG });
+      return;
+    }
     if (type === 'interrupt') {
       respond(requestId, { still_queued: [] });
       return;
     }
     if (type === 'daemon.close_session') {
-      if (typeof request.session_id === 'string') {
-        sessions.delete(request.session_id);
-        state.closes.push(request.session_id);
+      // 真实 daemon 从 control_request 信封读 session_id；payload 同名字段仅兼容旧版。
+      const target =
+        typeof sessionId === 'string' && sessionId
+          ? sessionId
+          : typeof request.session_id === 'string'
+            ? request.session_id
+            : '';
+      if (target) {
+        sessions.delete(target);
+        state.closes.push(target);
         flushState();
       }
       respond(requestId, {});

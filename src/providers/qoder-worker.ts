@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { QoderProviderConfig } from '../config.js';
+import { qoderCliLoginHint } from '../core/qoder-install.js';
 import { UpstreamError } from '../errors.js';
 import { log } from '../logger.js';
 
@@ -22,6 +23,33 @@ export interface QoderWorkerSnapshot {
   workspace: string | null;
   /** 子进程 stderr 尾部（排障用），经 admin API 透出。 */
   logTail: string[];
+  /** daemon.authenticate 结果（凭据状态，经 admin API 透出）。 */
+  auth: QoderAuthSnapshot;
+}
+
+export interface QoderAuthSnapshot {
+  method: 'accessToken' | 'serviceAccount' | 'qodercli' | 'none' | null;
+  authenticated: boolean | null;
+  error: string | null;
+}
+
+/**
+ * daemon.get_models 的模型条目（runtime 1.1.86 的 YCe 映射实测字段）。
+ * 只有 id 是必需项，其余字段按可选处理，避免 CLI 升级后整条目录消失。
+ */
+export interface QoderModelInfo {
+  /** runtime 的模型标识（modelId）：open_session 的 --model / upstream 都用它。 */
+  id: string;
+  displayName: string;
+  description: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  reasoning: boolean;
+  vision: boolean;
+  isDefault: boolean;
+  /** 该模型支持的推理强度档位（runtime 返回 efforts 时）。 */
+  efforts?: string[];
+  priceFactor?: number;
 }
 
 /**
@@ -81,6 +109,7 @@ export class QoderWorker {
     | null = null;
   private readonly logTail: string[] = [];
   private stdoutBuffer = '';
+  private auth: QoderAuthSnapshot = { method: null, authenticated: null, error: null };
 
   constructor(private readonly config: QoderProviderConfig) {}
 
@@ -93,6 +122,7 @@ export class QoderWorker {
       startedAt: this.startedAt,
       workspace: resolve(process.cwd(), this.config.workspace),
       logTail: this.logTail.slice(-20),
+      auth: { ...this.auth },
     };
   }
 
@@ -155,6 +185,20 @@ export class QoderWorker {
       throw new UpstreamError('qoder worker 未就绪', { category: 'server', retryable: false });
     }
     return this.dispatch<T>(type, params, opts);
+  }
+
+  /**
+   * daemon.get_models：读 daemon 侧的模型目录（authenticate 之后的账号可见模型）。
+   * 不带 fetchStrategy = auto：已登录时走 runtime 的 listModels()（可用本地缓存，不强制联网），
+   * 未登录时回落本地缓存而不是抛 AUTH_REQUIRED。
+   */
+  async getModels(options?: { timeoutMs?: number }): Promise<QoderModelInfo[]> {
+    const result = await this.request<{ models?: unknown }>(
+      'daemon.get_models',
+      {},
+      { timeoutMs: options?.timeoutMs ?? 30000 },
+    );
+    return normalizeQoderModels(result.models);
   }
 
   /** 绕过就绪守卫的实际发送逻辑（就绪探针在 starting 阶段也要能发握手）。 */
@@ -294,6 +338,9 @@ export class QoderWorker {
 
     try {
       await this.waitReady();
+      // 0.5.17 daemon.initialize 不消费 PAT；凭据要走 daemon.authenticate。
+      // 失败即认为渠道不可用（比 ready 后每个任务 401 更早暴露）。
+      await this.authenticate();
     } catch (error) {
       await this.killChild();
       this.setError(`qoder 启动失败: ${(error as Error).message}`);
@@ -345,6 +392,99 @@ export class QoderWorker {
         ? `qoder daemon 未在 ${this.config.startupTimeoutMs}ms 内就绪: ${lastError.message}`
         : `qoder daemon 未在 ${this.config.startupTimeoutMs}ms 内就绪`,
     );
+  }
+
+  /**
+   * daemon.authenticate 的候选凭据（顺序即优先级）：
+   * accessToken（PAT）→ serviceAccount → qodercli（复用本机 CLI/IDE 登录态）。
+   * 真实 runtime 不读 QODER_PERSONAL_ACCESS_TOKEN，必须显式把 token 送进 auth。
+   */
+  private authCandidates(): Array<{
+    method: QoderAuthSnapshot['method'];
+    auth: Record<string, unknown>;
+  }> {
+    const envValue = (...keys: string[]): string => {
+      for (const key of keys) {
+        const value = this.config.env[key] ?? process.env[key];
+        if (typeof value === 'string' && value.trim()) return value.trim();
+      }
+      return '';
+    };
+    const candidates: Array<{
+      method: QoderAuthSnapshot['method'];
+      auth: Record<string, unknown>;
+    }> = [];
+    const token = envValue(
+      'QODER_PERSONAL_ACCESS_TOKEN',
+      'QODER_SDK_ACCESS_TOKEN',
+      'QODERCN_PERSONAL_ACCESS_TOKEN',
+      'QODERCN_SDK_ACCESS_TOKEN',
+    );
+    if (token) {
+      candidates.push({
+        method: 'accessToken',
+        auth: { type: 'accessToken', accessToken: token },
+      });
+    }
+    const serviceAccountKey = envValue('QODER_SERVICE_ACCOUNT_KEY', 'QODERCN_SERVICE_ACCOUNT_KEY');
+    if (serviceAccountKey) {
+      candidates.push({
+        method: 'serviceAccount',
+        auth: { type: 'serviceAccount', serviceAccountKey },
+      });
+    }
+    // 兜底：让 daemon 复用 qodercli / IDE 的本地登录态。
+    candidates.push({ method: 'qodercli', auth: { type: 'qodercli' } });
+    return candidates;
+  }
+
+  private async authenticate(): Promise<void> {
+    const candidates = this.authCandidates();
+    const errors: string[] = [];
+    for (const candidate of candidates) {
+      try {
+        const result = await this.dispatch(
+          'daemon.authenticate',
+          { auth: candidate.auth },
+          { timeoutMs: 30000 },
+        );
+        if (result.authenticated === true) {
+          this.auth = { method: candidate.method, authenticated: true, error: null };
+          log.info(`qoder[${this.config.id}] 认证成功（${candidate.method}）`);
+          return;
+        }
+        const hint = candidate.method === 'qodercli' ? qoderCliLoginHint() : null;
+        errors.push(hint ? `qodercli: ${hint}` : `${candidate.method}: 未返回 authenticated=true`);
+      } catch (error) {
+        const message = (error as Error).message;
+        if (
+          /unknown request type|unknown method|method[_ ]?not[_ ]?found|not supported|不支持/i.test(
+            message,
+          )
+        ) {
+          // 旧版 CLI 没有 daemon.authenticate：保留兼容，不阻断启动。
+          this.auth = {
+            method: 'none',
+            authenticated: null,
+            error: `CLI 不支持 daemon.authenticate：${message}`,
+          };
+          log.warn(`qoder[${this.config.id}] ${this.auth.error}`);
+          return;
+        }
+        const hint = candidate.method === 'qodercli' ? qoderCliLoginHint() : null;
+        errors.push(`${candidate.method}: ${message}${hint ? `；${hint}` : ''}`);
+      }
+    }
+    this.auth = {
+      method: candidates[0]?.method ?? null,
+      authenticated: false,
+      error: errors.join('；') || 'qoder 认证失败',
+    };
+    throw new UpstreamError(this.auth.error ?? 'qoder 认证失败', {
+      category: 'auth',
+      retryable: false,
+      status: 401,
+    });
   }
 
   private startKeepAlive(): void {
@@ -411,17 +551,31 @@ export class QoderWorker {
       if (response?.subtype === 'success') {
         const result =
           response.response && typeof response.response === 'object' && !Array.isArray(response.response)
-            ? (response.response as Record<string, unknown>)
+            ? { ...(response.response as Record<string, unknown>) }
             : {};
+        // 真实 daemon 把 open_session 的 session id 放在 control_response 帧顶层
+        // （writeSuccess 的 session_id），payload 里通常没有；两种位置都接。
+        const envelopeSessionId =
+          typeof frame.session_id === 'string'
+            ? frame.session_id
+            : typeof response.session_id === 'string'
+              ? response.session_id
+              : '';
+        if (envelopeSessionId && typeof result.session_id !== 'string') {
+          result.session_id = envelopeSessionId;
+        }
         pending.resolve(result);
       } else {
+        // 真实协议的 error 是字符串（strict zod），旧版/兼容实现可能是对象。
         const error = response?.error;
         const message =
           typeof error === 'string'
             ? error
             : error && typeof error === 'object' && typeof (error as Record<string, unknown>).message === 'string'
               ? ((error as Record<string, unknown>).message as string)
-              : `qoder 协议错误 ${requestId}`;
+              : typeof response?.code === 'string'
+                ? `qoder 协议错误 ${requestId}: ${response.code}`
+                : `qoder 协议错误 ${requestId}`;
         pending.reject(
           new UpstreamError(message, { category: 'server', retryable: false }),
         );
@@ -436,9 +590,16 @@ export class QoderWorker {
         frame.request && typeof frame.request === 'object' && !Array.isArray(frame.request)
           ? (frame.request as Record<string, unknown>)
           : {};
-      const requestType = typeof request.type === 'string' ? request.type : '';
+      // 真实 daemon 用 request.subtype（can_use_tool / fetch_job_token 等），
+      // 旧实现/兼容层可能用 request.type；两者都认。
+      const requestType =
+        typeof request.subtype === 'string' && request.subtype
+          ? request.subtype
+          : typeof request.type === 'string'
+            ? request.type
+            : '';
       if (!requestType) {
-        this.writeInteractionError(requestId, '反向请求缺少 type');
+        this.writeInteractionError(requestId, '反向请求缺少 subtype/type');
         return;
       }
       const sessionId = typeof frame.session_id === 'string' ? frame.session_id : null;
@@ -503,12 +664,14 @@ export class QoderWorker {
   }
 
   private writeInteractionError(requestId: string, message: string): void {
+    // 真实 runtime 的 control_response error 必须是字符串（strict zod），
+    // 传对象会被整帧丢弃、让 CLI 侧的反向请求悬挂。
     this.writeFrame({
       type: 'control_response',
       response: {
         subtype: 'error',
         request_id: requestId,
-        error: { message },
+        error: message,
       },
     });
   }
@@ -597,6 +760,53 @@ export class QoderWorker {
     await this.killChild();
     this.state = 'stopped';
   }
+}
+
+function textOf(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function positiveInt(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * 把 daemon.get_models 的原始条目归一化成面板可用结构。
+ * 字段缺失 / 类型漂移一律降级（不抛错），否则一次 CLI 升级就会让整个模型目录不可用。
+ */
+export function normalizeQoderModels(raw: unknown): QoderModelInfo[] {
+  if (!Array.isArray(raw)) return [];
+  const models: QoderModelInfo[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const record = entry as Record<string, unknown>;
+    if (record.isEnabled === false) continue;
+    const id = textOf(record.modelId) || textOf(record.value) || textOf(record.id);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const efforts = Array.isArray(record.efforts)
+      ? record.efforts
+          .filter((effort): effort is string => typeof effort === 'string' && Boolean(effort.trim()))
+          .map((effort) => effort.trim())
+      : [];
+    models.push({
+      id,
+      displayName: textOf(record.displayName) || id,
+      description: textOf(record.description),
+      contextWindow: positiveInt(record.maxInputTokens),
+      maxOutputTokens: positiveInt(record.maxOutputTokens),
+      reasoning: record.isReasoning === true,
+      vision: record.isVl === true,
+      isDefault: record.isDefault === true,
+      efforts: efforts.length > 0 ? efforts : undefined,
+      priceFactor:
+        typeof record.priceFactor === 'number' && Number.isFinite(record.priceFactor)
+          ? record.priceFactor
+          : undefined,
+    });
+  }
+  return models;
 }
 
 let idCounter = 0;

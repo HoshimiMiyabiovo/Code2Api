@@ -31,6 +31,9 @@ async function readBody(req: IncomingMessage): Promise<string> {
 interface FakeOptions {
   /** 模拟严格上游：输入消息里出现 reasoning_content 就 400。 */
   rejectReasoningContent?: boolean;
+  streamMode?: 'sse' | 'json' | 'truncated' | 'heartbeat-timeout';
+  streamContentType?: string;
+  heartbeatDataDelayMs?: number;
 }
 
 async function startFake(options: FakeOptions = {}): Promise<FakeUpstream> {
@@ -75,8 +78,71 @@ async function startFake(options: FakeOptions = {}): Promise<FakeUpstream> {
       return;
     }
     if (body.stream === true) {
-      res.writeHead(200, { 'content-type': 'text/event-stream' });
-      const send = (data: unknown) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+      const send = (data: unknown) => {
+        if (!res.destroyed) res.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
+      if (options.streamMode === 'json') {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(
+          JSON.stringify({
+            id: 'fake-json-stream',
+            model,
+            choices: [
+              {
+                index: 0,
+                message: { role: 'assistant', content: 'Hello JSON' },
+                finish_reason: 'stop',
+              },
+            ],
+            usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+          }),
+        );
+        return;
+      }
+      res.writeHead(200, {
+        'content-type': options.streamContentType ?? 'text/event-stream',
+      });
+      if (options.streamMode === 'truncated') {
+        send({
+          id: 'fake-stream',
+          model,
+          choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+        });
+        send({
+          id: 'fake-stream',
+          model,
+          choices: [{ index: 0, delta: { content: 'partial' }, finish_reason: null }],
+        });
+        res.end();
+        return;
+      }
+      if (options.streamMode === 'heartbeat-timeout') {
+        const heartbeat = setInterval(() => {
+          if (!res.destroyed) res.write(': KILO PROCESSING\n\n');
+        }, 20);
+        const finish = setTimeout(() => {
+          clearInterval(heartbeat);
+          send({
+            id: 'fake-stream',
+            model,
+            choices: [{ index: 0, delta: { content: 'too late' }, finish_reason: null }],
+          });
+          send({
+            id: 'fake-stream',
+            model,
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          });
+          if (!res.destroyed) {
+            res.write('data: [DONE]\n\n');
+            res.end();
+          }
+        }, options.heartbeatDataDelayMs ?? 180);
+        res.on('close', () => {
+          clearInterval(heartbeat);
+          clearTimeout(finish);
+        });
+        return;
+      }
       send({
         id: 'fake-stream',
         model,
@@ -154,7 +220,26 @@ async function startGateway(yaml: string): Promise<Harness> {
   };
 }
 
-function gatewayYaml(fake: FakeUpstream): string {
+function gatewayYaml(
+  fake: FakeUpstream,
+  providerLines = '',
+  idleMs?: number,
+  retryEnabled?: boolean,
+): string {
+  const timeouts =
+    idleMs === undefined
+      ? ''
+      : `    timeouts:
+      connect_ms: 5000
+      ttfb_ms: 5000
+      idle_ms: ${idleMs}
+      total_ms: 10000`;
+  const retry =
+    retryEnabled === undefined
+      ? ''
+      : `routing:
+  retry:
+    enabled: ${retryEnabled}`;
   return `
 server:
   port: 0
@@ -162,6 +247,7 @@ storage:
   path: __DB__
 catalog:
   sync_enabled: false
+${retry}
 providers:
   - id: go
     type: openai-compatible
@@ -169,12 +255,16 @@ providers:
     models_url: ${fake.baseUrl}/inference/go/v1/models
     session_header: x-opencode-session
     user_agent: code2api-test/9.9
+${providerLines}
+${timeouts}
     keys:
       - label: main
         key: test-key
     models:
       - id: go-model
         upstream: go-model
+        capabilities:
+          reasoning: true
 `;
 }
 
@@ -364,6 +454,9 @@ providers:
     enabled: true,
     baseUrl: `${fake.baseUrl}/inference/go/openai/v1`,
     modelsUrl: `${fake.baseUrl}/inference/go/v1/models`,
+    freeOnly: true,
+    reasoningField: 'reasoning.effort',
+    reasoningOffField: 'reasoning.enabled',
     userAgent: 'panel-test/2.0',
     sessionHeader: 'x-opencode-session',
     authHeader: 'bearer',
@@ -388,6 +481,9 @@ providers:
     );
     assert.ok(channel);
     assert.equal(channel.modelsUrl, basePayload.modelsUrl);
+    assert.equal(channel.freeOnly, true);
+    assert.equal(channel.reasoningField, 'reasoning.effort');
+    assert.equal(channel.reasoningOffField, 'reasoning.enabled');
     assert.equal(channel.userAgent, basePayload.userAgent);
     assert.equal(channel.sessionHeader, basePayload.sessionHeader);
 
@@ -398,6 +494,9 @@ providers:
       body: JSON.stringify({
         ...basePayload,
         modelsUrl: '',
+        freeOnly: false,
+        reasoningField: '',
+        reasoningOffField: '',
         userAgent: '',
         sessionHeader: '',
         keys: [{ action: 'keep', label: 'main' }],
@@ -411,6 +510,9 @@ providers:
       (item) => item.id === 'go-panel',
     );
     assert.equal(clearedChannel?.modelsUrl, null);
+    assert.equal(clearedChannel?.freeOnly, false);
+    assert.equal(clearedChannel?.reasoningField, null);
+    assert.equal(clearedChannel?.reasoningOffField, null);
     assert.equal(clearedChannel?.userAgent, null);
     assert.equal(clearedChannel?.sessionHeader, null);
   } finally {
@@ -446,6 +548,83 @@ test('models_url 覆盖模型目录地址', async () => {
     assert.equal(fetched[0]!.url, '/inference/go/v1/models');
     assert.match(String(fetched[0]!.headers['x-opencode-session']), /^ses_[0-9a-f]{32}$/);
   } finally {
+    await fake.close();
+  }
+});
+
+test('流式解析：application/json 头但 SSE 体仍正常 replay', async () => {
+  const fake = await startFake({ streamContentType: 'application/json' });
+  const harness = await startGateway(gatewayYaml(fake));
+  try {
+    const response = await postChat(harness, {}, {
+      model: 'go-model',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(text, /Hello/);
+    assert.equal(fake.requests.filter((item) => item.method === 'POST').length, 1);
+  } finally {
+    await harness.close();
+    await fake.close();
+  }
+});
+
+test('流式解析：text/event-stream 头但 JSON 完整响应折叠为增量', async () => {
+  const fake = await startFake({ streamMode: 'json' });
+  const harness = await startGateway(gatewayYaml(fake));
+  try {
+    const response = await postChat(harness, {}, {
+      model: 'go-model',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(text, /Hello JSON/);
+    assert.equal(fake.requests.filter((item) => item.method === 'POST').length, 1);
+  } finally {
+    await harness.close();
+    await fake.close();
+  }
+});
+
+test('流式截断：已输出内容后无终帧报错且不重放', async () => {
+  const fake = await startFake({ streamMode: 'truncated' });
+  const harness = await startGateway(gatewayYaml(fake));
+  try {
+    const response = await postChat(harness, {}, {
+      model: 'go-model',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(text, /partial/);
+    assert.match(text, /terminal frame/);
+    assert.equal(fake.requests.filter((item) => item.method === 'POST').length, 1);
+  } finally {
+    await harness.close();
+    await fake.close();
+  }
+});
+
+test('流式心跳：注释帧不重置有效内容空闲计时', async () => {
+  const fake = await startFake({ streamMode: 'heartbeat-timeout' });
+  const harness = await startGateway(gatewayYaml(fake, '', 100, false));
+  try {
+    const response = await postChat(harness, {}, {
+      model: 'go-model',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const body = await response.json();
+    assert.equal(response.status, 504);
+    assert.match(body.error.message, /idle for \d+ms/);
+    assert.equal(fake.requests.filter((item) => item.method === 'POST').length, 1);
+  } finally {
+    await harness.close();
     await fake.close();
   }
 });

@@ -40,6 +40,7 @@ interface OpenAIChunkChoice {
     reasoning_content?: string;
     reasoning?: string;
     tool_calls?: Array<{
+      index?: number;
       id?: string;
       type?: string;
       function?: { name?: string; arguments?: string };
@@ -215,10 +216,18 @@ function mapStop(stop?: string[]): string[] | undefined {
   return stop && stop.length > 0 ? stop : undefined;
 }
 
-/**
- * 从上游 /models 条目中探测上下文窗口。
- * 各厂商字段不统一，按常见命名依次取值；不含 max_tokens（它常表示输出上限）。
- */
+function positiveInteger(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return Math.trunc(value);
+  }
+  if (typeof value === 'string' && /^\d+$/.test(value)) {
+    const parsed = Number(value);
+    if (parsed > 0) return Math.trunc(parsed);
+  }
+  return undefined;
+}
+
+/** 各厂商字段不统一；不含 max_tokens，避免把输出上限当成上下文窗口。 */
 const CONTEXT_WINDOW_KEYS = [
   'context_length',
   'max_context_window',
@@ -230,16 +239,33 @@ const CONTEXT_WINDOW_KEYS = [
   'max_input_tokens',
 ] as const;
 
+const MAX_OUTPUT_KEYS = ['max_completion_tokens', 'max_output_tokens'] as const;
+
+function recordOf(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
 function detectContextWindow(item: Record<string, unknown>): number | undefined {
   for (const key of CONTEXT_WINDOW_KEYS) {
-    const value = item[key];
-    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
-      return Math.trunc(value);
-    }
-    if (typeof value === 'string' && /^\d+$/.test(value)) {
-      const parsed = Number(value);
-      if (parsed > 0) return Math.trunc(parsed);
-    }
+    const value = positiveInteger(item[key]);
+    if (value !== undefined) return value;
+  }
+  const topProvider = recordOf(item.top_provider);
+  return topProvider ? positiveInteger(topProvider.context_length) : undefined;
+}
+
+function detectMaxOutputTokens(item: Record<string, unknown>): number | undefined {
+  for (const key of MAX_OUTPUT_KEYS) {
+    const value = positiveInteger(item[key]);
+    if (value !== undefined) return value;
+  }
+  const topProvider = recordOf(item.top_provider);
+  if (!topProvider) return undefined;
+  for (const key of MAX_OUTPUT_KEYS) {
+    const value = positiveInteger(topProvider[key]);
+    if (value !== undefined) return value;
   }
   return undefined;
 }
@@ -439,6 +465,49 @@ function readWithIdleTimeout(
   });
 }
 
+interface StreamReadState {
+  sawDone: boolean;
+  sawJson: boolean;
+}
+
+type BodyShape = 'sse' | 'json' | 'empty' | 'unknown';
+
+function sniffBody(text: string): BodyShape {
+  const trimmed = text.trimStart();
+  if (!trimmed) return 'unknown';
+  if (
+    trimmed.startsWith('data:') ||
+    trimmed.startsWith('event:') ||
+    trimmed.startsWith(':')
+  ) {
+    return 'sse';
+  }
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) return 'json';
+  return 'unknown';
+}
+
+async function readStreamHead(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  decoder: InstanceType<typeof TextDecoder>,
+  idleMs: number,
+  controller: AbortController,
+  ctx: ChatContext,
+): Promise<{ text: string; done: boolean; shape: BodyShape }> {
+  let text = '';
+  let bytes = 0;
+  while (bytes < 4096) {
+    const result = await readWithIdleTimeout(reader, idleMs, controller, ctx);
+    if (result.done) {
+      return { text, done: true, shape: text.trim() ? sniffBody(text) : 'empty' };
+    }
+    bytes += result.value.byteLength;
+    text += decoder.decode(result.value, { stream: true });
+    const shape = sniffBody(text);
+    if (shape !== 'unknown') return { text, done: false, shape };
+  }
+  return { text, done: false, shape: sniffBody(text) };
+}
+
 interface OpenResult {
   res: Response;
   controller: AbortController;
@@ -507,7 +576,16 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     if (request.responseFormat) body.response_format = request.responseFormat;
     if (!opts.stripReasoning) {
       const effort = reasoningEffortOf(request, model, this.cfg);
-      if (effort) body.reasoning_effort = effort;
+      if (effort) {
+        const disabled = effort === 'disabled' || effort === 'none' || effort === 'off';
+        if (disabled && this.cfg.reasoningOffField) {
+          setPath(body, this.cfg.reasoningOffField, false);
+        } else if (this.cfg.reasoningField) {
+          setPath(body, this.cfg.reasoningField, effort);
+        } else {
+          body.reasoning_effort = effort;
+        }
+      }
       if (request.reasoningMaxTokens && this.cfg.reasoningBudgetField) {
         setPath(body, this.cfg.reasoningBudgetField, request.reasoningMaxTokens);
       }
@@ -785,16 +863,18 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       if (Array.isArray(json.data)) {
         for (const item of json.data) {
           if (typeof item === 'string' && item) {
-            models.push({ id: item });
+            if (!this.cfg.freeOnly) models.push({ id: item });
             continue;
           }
           if (item && typeof item === 'object') {
             const record = item as Record<string, unknown>;
+            if (this.cfg.freeOnly && record.isFree !== true) continue;
             const id = record.id;
             if (typeof id === 'string' && id) {
               models.push({
                 id,
                 contextWindow: detectContextWindow(record),
+                maxOutputTokens: detectMaxOutputTokens(record),
                 capabilities: detectCapabilities(record),
               });
             }
@@ -816,6 +896,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     res: Response,
     controller: AbortController,
     ctx: ChatContext,
+    state: StreamReadState,
   ): AsyncGenerator<Record<string, unknown>, void, void> {
     if (!res.body) {
       throw new UpstreamError('upstream returned an empty body', {
@@ -825,33 +906,98 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = '';
     try {
-      while (true) {
-        const result = await readWithIdleTimeout(
-          reader,
-          this.cfg.timeouts.idleMs,
-          controller,
-          ctx,
+      const head = await readStreamHead(
+        reader,
+        decoder,
+        this.cfg.timeouts.idleMs,
+        controller,
+        ctx,
+      );
+      if (head.shape === 'empty') {
+        throw new UpstreamError('upstream returned an empty body', {
+          category: 'empty_stream',
+          retryable: true,
+        });
+      }
+      if (head.shape === 'unknown') {
+        throw new UpstreamError(
+          `unexpected non-stream response: ${head.text.slice(0, 200)}`,
+          { category: 'server', retryable: false },
         );
-        if (result.done) break;
-        buffer += decoder.decode(result.value, { stream: true });
+      }
+      if (head.shape === 'json') {
+        let text = head.text;
+        while (!head.done) {
+          const result = await readWithIdleTimeout(
+            reader,
+            this.cfg.timeouts.idleMs,
+            controller,
+            ctx,
+          );
+          if (result.done) break;
+          text += decoder.decode(result.value, { stream: true });
+        }
+        text += decoder.decode();
+        let payload: unknown;
+        try {
+          payload = JSON.parse(text);
+        } catch {
+          throw new UpstreamError(`unexpected non-stream response: ${text.slice(0, 200)}`, {
+            category: 'server',
+          });
+        }
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+          throw new UpstreamError('upstream returned a non-object JSON response', {
+            category: 'server',
+          });
+        }
+        state.sawJson = true;
+        yield payload as Record<string, unknown>;
+        return;
+      }
+
+      let buffer = head.text;
+      let done = head.done;
+      let lastEffectiveAt = Date.now();
+      while (true) {
         let newline = buffer.indexOf('\n');
         while (newline >= 0) {
           const line = buffer.slice(0, newline).replace(/\r$/, '');
           buffer = buffer.slice(newline + 1);
           const chunk = sseLineToChunk(line);
-          if (chunk === 'done') return;
-          if (chunk) yield chunk;
+          if (chunk === 'done') {
+            state.sawDone = true;
+            return;
+          }
+          if (chunk) {
+            lastEffectiveAt = Date.now();
+            yield chunk;
+          }
           newline = buffer.indexOf('\n');
         }
-      }
-      buffer += decoder.decode();
-      const rest = buffer.trim();
-      if (rest) {
-        const chunk = sseLineToChunk(rest.replace(/\r$/, ''));
-        if (chunk === 'done') return;
-        if (chunk) yield chunk;
+        if (done) {
+          buffer += decoder.decode();
+          const rest = buffer.trim();
+          if (rest) {
+            const chunk = sseLineToChunk(rest.replace(/\r$/, ''));
+            if (chunk === 'done') {
+              state.sawDone = true;
+              return;
+            }
+            if (chunk) yield chunk;
+          }
+          break;
+        }
+        const remaining = this.cfg.timeouts.idleMs - (Date.now() - lastEffectiveAt);
+        if (remaining <= 0) {
+          throw new UpstreamError(`upstream stream idle for ${this.cfg.timeouts.idleMs}ms`, {
+            category: 'timeout',
+          });
+        }
+        const result = await readWithIdleTimeout(reader, remaining, controller, ctx);
+        done = result.done;
+        if (!done) buffer += decoder.decode(result.value, { stream: true });
       }
     } finally {
       try {
@@ -913,9 +1059,10 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     let sawChunk = false;
     let sawContent = false;
     let finishReason: StopReason | null = null;
+    const streamState: StreamReadState = { sawDone: false, sawJson: false };
 
     try {
-      for await (const raw of this.readSse(res, controller, ctx)) {
+      for await (const raw of this.readSse(res, controller, ctx, streamState)) {
         sawChunk = true;
         const chunk = raw as OpenAIChunk;
         if (chunk.error) {
@@ -929,7 +1076,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
           yield { type: 'usage', usage: normalizeUsage(chunk.usage) };
         }
         for (const choice of chunk.choices ?? []) {
-          const delta = choice.delta;
+          const delta = choice.delta ?? choice.message;
           if (delta) {
             const reasoning = delta.reasoning_content ?? delta.reasoning;
             if (typeof reasoning === 'string' && reasoning) {
@@ -975,6 +1122,12 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
         throw new UpstreamError('upstream ended before first chunk', {
           category: 'empty_stream',
           retryable: true,
+        });
+      }
+      if (!streamState.sawDone && !streamState.sawJson && finishReason === null) {
+        throw new UpstreamError('upstream stream ended before terminal frame', {
+          category: 'stream_cut',
+          retryable: false,
         });
       }
       if (finishReason === null) {

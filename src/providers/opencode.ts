@@ -60,7 +60,7 @@ interface TaskRuntime {
 
 interface PendingQuestion {
   id: string;
-  kind: 'form' | 'permission';
+  kind: 'form' | 'permission' | 'question';
   requestId: string;
   runtime: TaskRuntime;
   payload: unknown;
@@ -74,7 +74,7 @@ export interface PendingQuestionView {
   providerId: string;
   gatewaySessionId: string;
   ocSessionId: string;
-  kind: 'form' | 'permission';
+  kind: 'form' | 'permission' | 'question';
   payload: unknown;
   createdAt: number;
 }
@@ -623,7 +623,39 @@ export class OpenCodeAdapter implements ProviderAdapter {
     }
     const record = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
     try {
-      if (pending.kind === 'form') {
+      if (pending.kind === 'question') {
+        // kilo 的 question 工具（模型向用户提问）。v2 reply 是
+        // POST /question/{requestID}/reply，body { answers: string[][] }：
+        // 按 questions 顺序、每项是该问题的选中标签数组（KiloClient SDK 契约）。
+        // 原版 opencode 没有 question 路由，此 kind 只在 kilo flavor 下产生。
+        if (this.config.flavor !== 'kilo') {
+          throw new GatewayError('该渠道不支持 question 提问', {
+            status: 400,
+            type: 'invalid_request_error',
+          });
+        }
+        if (record.reject === true) {
+          await pending.runtime.worker.api(
+            'POST',
+            `/question/${pending.requestId}/reject`,
+          );
+        } else {
+          const answers = record.answers;
+          if (
+            !Array.isArray(answers) ||
+            answers.length === 0 ||
+            !answers.every((item) => Array.isArray(item))
+          ) {
+            throw new GatewayError(
+              '回答必须是 { answers: string[][] }（按问题顺序、每项为选中标签数组），或 { reject: true }',
+              { status: 400, type: 'invalid_request_error' },
+            );
+          }
+          await pending.runtime.worker.api('POST', `/question/${pending.requestId}/reply`, {
+            answers,
+          });
+        }
+      } else if (pending.kind === 'form') {
         const answer = record.answer;
         if (!answer || typeof answer !== 'object') {
           throw new GatewayError('表单回答必须是对象', {
@@ -632,10 +664,12 @@ export class OpenCodeAdapter implements ProviderAdapter {
           });
         }
         if (this.config.flavor === 'kilo') {
-          // kilo fork 没有 form 路由，等价物是 question（SDK 实测 body 为 answers 数组）。
+          // kilo fork 没有 form 路由，等价物是 question。v2 reply 是
+          // POST /question/{requestID}/reply，body { answers: [...] }，
+          // query directory/workspace 可选（KiloClient SDK 实测）。
           await pending.runtime.worker.api(
             'POST',
-            `/api/session/${pending.runtime.ocSessionId}/question/${pending.requestId}/reply`,
+            `/question/${pending.requestId}/reply`,
             { answers: [answer] },
           );
         } else {
@@ -653,13 +687,17 @@ export class OpenCodeAdapter implements ProviderAdapter {
             type: 'invalid_request_error',
           });
         }
-        // kilo fork：permission reply 的 body 键是 { reply }（SDK 实测枚举
-        // once/always/reject 与原版一致）；原版 opencode 是 { decision }。
-        // codearts 沿用原版 { decision }（旧版 opencode API，未实测差异时保守一致）。
+        // kilo v2 API 的 permission reply 是 POST /session/{sessionID}/permissions/{permissionID}
+        // （复数、无 /reply 后缀），body 键是 response（枚举 once/always/reject）。
+        // 旧版 v1 /api/session/.../permission/.../reply 路由在 kilo 不存在，每次应答都 404，
+        // 表现为面板点审批后任务永不恢复（app.asar KiloClient SDK 实测契约）。
+        // codearts 沿用原版 v1 { decision }（未实测差异时保守一致）。
         await pending.runtime.worker.api(
           'POST',
-          `/api/session/${pending.runtime.ocSessionId}/permission/${pending.requestId}/reply`,
-          this.config.flavor === 'kilo' ? { reply: decision } : { decision },
+          this.config.flavor === 'kilo'
+            ? `/session/${pending.runtime.ocSessionId}/permissions/${pending.requestId}`
+            : `/api/session/${pending.runtime.ocSessionId}/permission/${pending.requestId}/reply`,
+          this.config.flavor === 'kilo' ? { response: decision } : { decision },
         );
       }
     } catch (error) {
@@ -667,10 +705,10 @@ export class OpenCodeAdapter implements ProviderAdapter {
       // 清掉陈旧挂起项并给客户端可理解的提示，而不是裸 502。
       if (error instanceof UpstreamError && error.status === 404) {
         this.clearPending(pending, 'expired');
-        throw new GatewayError(
-          `该${pending.kind === 'form' ? '提问' : '审批'}请求已失效（对应任务已结束或服务端已丢弃），请重新发起对话`,
-          { status: 410, type: 'invalid_request_error', code: 'request_expired' },
-        );
+      throw new GatewayError(
+        `该${pending.kind === 'permission' ? '审批' : '提问'}请求已失效（对应任务已结束或服务端已丢弃），请重新发起对话`,
+        { status: 410, type: 'invalid_request_error', code: 'request_expired' },
+      );
       }
       if (error instanceof GatewayError) throw error;
       throw new GatewayError(`提交回答失败: ${(error as Error).message}`, {
@@ -958,7 +996,7 @@ export class OpenCodeAdapter implements ProviderAdapter {
 
   private addQuestion(
     runtime: TaskRuntime,
-    kind: 'form' | 'permission',
+    kind: 'form' | 'permission' | 'question',
     requestId: string,
     payload: unknown,
     resolveOutcome: (outcome: TaskOutcome) => void,
@@ -1019,10 +1057,20 @@ export class OpenCodeAdapter implements ProviderAdapter {
     requestId: string,
     decision: 'once' | 'always' | 'reject',
   ): Promise<void> {
+    // kilo 走 v2 /session/{sessionID}/permissions/{permissionID}，body { response }；
+    // 原版走 v1 /api/session/.../permission/.../reply，body { decision }。
+    if (this.config.flavor === 'kilo') {
+      await runtime.worker.api(
+        'POST',
+        `/session/${runtime.ocSessionId}/permissions/${requestId}`,
+        { response: decision },
+      );
+      return;
+    }
     await runtime.worker.api(
       'POST',
       `/api/session/${runtime.ocSessionId}/permission/${requestId}/reply`,
-      this.config.flavor === 'kilo' ? { reply: decision } : { decision },
+      { decision },
     );
   }
 
@@ -1030,7 +1078,7 @@ export class OpenCodeAdapter implements ProviderAdapter {
    * 首包预算只认「模型真的开始处理」的事件：
    * - 用户消息回显（message.updated role=user）会立刻到达，不能拿来抵消首包预算；
    * - 文本/推理/step/工具/执行结果/提问/权限请求都算上游有响应；
-   * - permission.replied / session.form.replied 是面板侧动作，不算。
+   * - permission.replied / session.form.replied / question.replied / question.rejected 是面板侧动作，不算。
    */
   private countsAsProgress(event: OpenCodeEvent, runtime: TaskRuntime): boolean {
     const data = event.data ?? {};
@@ -1046,9 +1094,15 @@ export class OpenCodeAdapter implements ProviderAdapter {
       }
       case 'permission.replied':
       case 'session.form.replied':
+      case 'question.replied':
+      case 'question.v2.replied':
+      case 'question.rejected':
+      case 'question.v2.rejected':
         return false;
       case 'form.created':
       case 'permission.asked':
+      case 'question.asked':
+      case 'question.v2.asked':
         return true;
       default:
         return (
@@ -1267,6 +1321,49 @@ export class OpenCodeAdapter implements ProviderAdapter {
             emit,
             `需要审批：${action} ${resources}。请到 Code2Api 面板「待处理提问」中允许或拒绝。`,
           );
+        }
+        break;
+      }
+      case 'question.asked':
+      case 'question.v2.asked': {
+        // kilo 的 question 工具（模型向用户提问，事件 payload：
+        // { id, sessionID, questions: [{question, header, options, multiple?, custom?}], tool? }，
+        // KiloClient SDK 实测契约）。v1 事件名 question.asked / v2 事件名都处理。
+        const requestId = typeof data.id === 'string' ? data.id : '';
+        if (!requestId) break;
+        if (!Array.isArray(data.questions) || data.questions.length === 0) break;
+        this.addQuestion(
+          runtime,
+          'question',
+          requestId,
+          data,
+          resolveOutcome,
+          emit,
+          '模型向你提问。请到 Code2Api 面板「待处理提问」中回答。',
+        );
+        break;
+      }
+      case 'question.replied':
+      case 'question.v2.replied': {
+        const requestId = typeof data.requestID === 'string' ? data.requestID : '';
+        const pending = [...this.pendingQuestions.values()].find(
+          (item) => item.requestId === requestId && item.kind === 'question',
+        );
+        if (pending) {
+          this.clearPending(pending, 'answered', { answers: data.answers });
+          pending.runtime.suspended = false;
+        }
+        break;
+      }
+      case 'question.rejected':
+      case 'question.v2.rejected': {
+        const requestId = typeof data.requestID === 'string' ? data.requestID : '';
+        const pending = [...this.pendingQuestions.values()].find(
+          (item) => item.requestId === requestId && item.kind === 'question',
+        );
+        if (pending) {
+          this.clearPending(pending, 'answered', { rejected: true });
+          pending.runtime.suspended = false;
         }
         break;
       }

@@ -44,6 +44,12 @@ class FakeOpenCode {
   }> = undefined;
   readonly prompts: Array<{ sessionID: string; text: string }> = [];
   readonly decisions: string[] = [];
+  /** kilo v2 permission reply 的原始形状（路径参数 + body），用于断言网关发的是 v2 契约。 */
+  readonly permissionReplies: Array<{
+    sessionID: string;
+    permissionID: string;
+    response: string;
+  }> = [];
   readonly answers: unknown[] = [];
   readonly createdLocations: Array<string | undefined> = [];
   readonly modelSelections: any[] = [];
@@ -54,7 +60,12 @@ class FakeOpenCode {
   private lastReply = '';
   private assistantId = 'msg_fake_assistant';
   private questionSession = '';
-  private permissionSession = '';
+  /** mode='permission' 时记录最近一次挂起审批的会话 ID（测试断言用）。 */
+  permissionSession = '';
+  /** kilo v2 question reply 记录（requestID + answers），断言网关发的是 v2 契约。 */
+  readonly questionReplies: Array<{ requestID: string; answers: unknown }> = [];
+  /** kilo v2 question reject 记录。 */
+  readonly questionRejections: string[] = [];
 
   constructor() {
     this.server = createServer((req, res) => {
@@ -284,6 +295,85 @@ class FakeOpenCode {
       return;
     }
 
+    // kilo v2 question reply/reject：POST /question/{requestID}/reply（body { answers: string[][] }）
+    // 与 POST /question/{requestID}/reject（KiloClient SDK 契约，模型提问工具）。
+    const v2QuestionReply = /^\/question\/([^/]+)\/(reply|reject)$/.exec(url.pathname);
+    if (v2QuestionReply && this.flavor === 'kilo' && req.method === 'POST') {
+      const requestID = decodeURIComponent(v2QuestionReply[1] ?? '');
+      const action = v2QuestionReply[2] ?? 'reply';
+      const sessionID = this.questionSession;
+      if (action === 'reject') {
+        this.questionRejections.push(requestID);
+        this.emit('question.rejected', { sessionID, requestID });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{}');
+        this.finishTask(sessionID, 'msg_after_question', 'question rejected');
+        return;
+      }
+      const body = await readJson(req);
+      const answers = body.answers;
+      if (
+        !Array.isArray(answers) ||
+        answers.length === 0 ||
+        !answers.every((item: unknown) => Array.isArray(item))
+      ) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            _tag: 'InvalidRequestError',
+            message: 'Missing key\n at ["answers"]',
+            kind: 'Payload',
+          }),
+        );
+        return;
+      }
+      this.questionReplies.push({ requestID, answers });
+      this.emit('question.replied', { sessionID, requestID, answers });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+      this.finishTask(sessionID, 'msg_after_question', 'fake reply after question');
+      return;
+    }
+
+    const v2PermissionReply = /^\/session\/([^/]+)\/permissions\/([^/]+)$/.exec(
+      url.pathname,
+    );
+    if (v2PermissionReply && this.flavor === 'kilo' && req.method === 'POST') {
+      const sessionID = decodeURIComponent(v2PermissionReply[1] ?? '');
+      const permissionID = decodeURIComponent(v2PermissionReply[2] ?? '');
+      const body = await readJson(req);
+      if (
+        body.response !== 'once' &&
+        body.response !== 'always' &&
+        body.response !== 'reject'
+      ) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            _tag: 'InvalidRequestError',
+            message: 'Missing key\n at ["response"]',
+            kind: 'Payload',
+          }),
+        );
+        return;
+      }
+      this.decisions.push(body.response);
+      this.permissionReplies.push({
+        sessionID,
+        permissionID,
+        response: body.response,
+      });
+      this.emit('permission.replied', {
+        sessionID,
+        requestID: permissionID,
+        reply: body.response,
+      });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+      this.finishTask(sessionID, 'msg_after_permission', 'permission handled');
+      return;
+    }
+
     // kilo fork：v2 /session/:id/message 才真正调度 agent loop（v1 /prompt 只入队）。
     // 事件流用 message.part.updated（part 累积全文）+ message.updated + session.idle。
     const v2Message = /^\/session\/([^/]+)\/message$/.exec(url.pathname);
@@ -319,6 +409,18 @@ class FakeOpenCode {
       const partID = `prt_${this.counter}`;
       const userMessageID = `msg_user_${this.counter}`;
       setTimeout(() => {
+        if (this.mode === 'permission') {
+          // kilo v2 路径同样支持审批挂起场景。
+          this.permissionSession = sessionID;
+          this.emit('permission.asked', {
+            id: 'per_fake_1',
+            sessionID,
+            permission: 'bash',
+            patterns: ['git status --short'],
+            metadata: { command: 'git status --short' },
+          });
+          return;
+        }
         // 先推 user 消息的角色登记与 part 全文——回归断言：网关绝不能把 user part 当模型输出透传。
         this.emit('message.updated', {
           sessionID,
@@ -529,12 +631,24 @@ class FakeOpenCode {
           }
           if (this.mode === 'permission') {
             this.permissionSession = sessionID;
-            this.emit('permission.asked', {
-              id: 'per_fake_1',
-              sessionID,
-              action: 'read',
-              resources: ['*.env'],
-            });
+            if (this.flavor === 'kilo') {
+              // kilo 实测 payload：{id, sessionID, permission, patterns, metadata}，
+              // 没有 action/resources 字段。
+              this.emit('permission.asked', {
+                id: 'per_fake_1',
+                sessionID,
+                permission: 'bash',
+                patterns: ['git status --short'],
+                metadata: { command: 'git status --short' },
+              });
+            } else {
+              this.emit('permission.asked', {
+                id: 'per_fake_1',
+                sessionID,
+                action: 'read',
+                resources: ['*.env'],
+              });
+            }
             return;
           }
           this.emit('session.tool.called', {
@@ -556,35 +670,15 @@ class FakeOpenCode {
         }, 20);
         return;
       }
-      // kilo fork：form 等价物是 question，body 为 { answers: [...] }。
+      // kilo fork：v1 question reply 路由不存在（v2 是顶层 /question/:requestID/reply）。
       if (
         this.flavor === 'kilo' &&
         req.method === 'POST' &&
         rest.startsWith('/question/') &&
         rest.endsWith('/reply')
       ) {
-        const body = await readJson(req);
-        const answer = Array.isArray(body.answers) ? body.answers[0] : undefined;
-        if (answer === undefined) {
-          res.writeHead(400, { 'content-type': 'application/json' });
-          res.end(
-            JSON.stringify({
-              _tag: 'InvalidRequestError',
-              message: 'Missing key\n at ["answers"]',
-              kind: 'Payload',
-            }),
-          );
-          return;
-        }
-        this.answers.push(answer);
-        this.emit('form.replied', {
-          sessionID,
-          id: 'frm_fake_1',
-          answer,
-        });
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end('{}');
-        this.finishTask(sessionID, 'msg_after_answer', 'fake reply after answer');
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'not found' } }));
         return;
       }
       if (req.method === 'POST' && rest.startsWith('/form/') && rest.endsWith('/reply')) {
@@ -605,16 +699,27 @@ class FakeOpenCode {
         rest.startsWith('/permission/') &&
         rest.endsWith('/reply')
       ) {
+        if (this.flavor === 'kilo') {
+          // kilo fork 没有 v1 permission reply 路由（真实 404），网关必须走 v2
+          // /session/:id/permissions/:permissionID；此分支防回归。
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              _tag: 'NotFoundError',
+              data: { message: 'Permission not found' },
+            }),
+          );
+          return;
+        }
         const body = await readJson(req);
-        // kilo fork 的 permission reply body 键是 { reply }；原版是 { decision }。
-        const decision =
-          this.flavor === 'kilo' ? body.reply : body.decision;
+        // 原版 opencode 的 permission reply body 键是 { decision }。
+        const decision = body.decision;
         if (typeof decision !== 'string') {
           res.writeHead(400, { 'content-type': 'application/json' });
           res.end(
             JSON.stringify({
               _tag: 'InvalidRequestError',
-              message: 'Missing key\n at ["reply"]',
+              message: 'Missing key\n at ["decision"]',
               kind: 'Payload',
             }),
           );
@@ -869,6 +974,151 @@ test('opencode 审批自动允许', async () => {
     assert.deepEqual(fake.decisions, ['once']);
     const questions = await adminGet(harness, '/admin/api/questions');
     assert.equal(questions.questions.length, 0);
+  } finally {
+    await harness.close();
+    await fake.close();
+  }
+});
+
+test('opencode 审批挂起：面板应答走 v1 reply 路由后任务继续', async () => {
+  const fake = new FakeOpenCode();
+  await fake.start();
+  fake.mode = 'permission';
+  const harness = await startGateway(configYaml(fake, 'ask'), fake.password);
+  try {
+    const response = await fetch(`${harness.base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-code2api-session': 'oc-perm-ask-1',
+      },
+      body: JSON.stringify({
+        model: 'oc-test',
+        stream: true,
+        messages: [{ role: 'user', content: 'need permission' }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const bodyPromise = response.text();
+
+    let questions: any[] = [];
+    for (let i = 0; i < 50; i += 1) {
+      const data = await adminGet(harness, '/admin/api/questions');
+      questions = data.questions;
+      if (questions.length > 0) break;
+      await sleep(100);
+    }
+    assert.equal(questions.length, 1);
+    assert.equal(questions[0].kind, 'permission');
+
+    const answer = await fetch(
+      `${harness.base}/admin/api/questions/${questions[0].id}/answer`,
+      {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${harness.adminToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ decision: 'once' }),
+      },
+    );
+    assert.equal(answer.status, 200);
+    const sse = await bodyPromise;
+    assert.match(sse, /permission handled/);
+    assert.deepEqual(fake.decisions, ['once']);
+    // 原版必须走 v1 路由，v2 permissions 是 kilo 专属。
+    assert.equal(fake.permissionReplies.length, 0);
+    const pending = await adminGet(harness, '/admin/api/questions');
+    assert.equal(pending.questions.length, 0);
+  } finally {
+    await harness.close();
+    await fake.close();
+  }
+});
+
+test('kilo 审批挂起：面板应答走 v2 permissions 路由后任务继续', async () => {
+  const fake = new FakeOpenCode();
+  fake.flavor = 'kilo';
+  fake.mode = 'permission';
+  await fake.start();
+  const harness = await startGateway(`
+server:
+  port: 0
+admin:
+  token: test-admin
+storage:
+  path: __DB__
+providers:
+  - id: fake-kilo-perm
+    type: opencode
+    flavor: kilo
+    priority: 10
+    base_url: ${fake.baseUrl}
+    password_env: C2A_TEST_OC_PASSWORD
+    permission_mode: ask
+    question_timeout_ms: 60000
+    task_timeout_ms: 120000
+    models:
+      - id: oc-test
+        upstream: fake/fake-model
+        context_window: 100000
+        max_output_tokens: 8192
+        capabilities:
+          tools: true
+          vision: false
+          reasoning: true
+`, fake.password);
+  try {
+    const response = await fetch(`${harness.base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-code2api-session': 'kilo-perm-1',
+      },
+      body: JSON.stringify({
+        model: 'oc-test',
+        stream: true,
+        messages: [{ role: 'user', content: 'need permission' }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const bodyPromise = response.text();
+
+    let questions: any[] = [];
+    for (let i = 0; i < 50; i += 1) {
+      const data = await adminGet(harness, '/admin/api/questions');
+      questions = data.questions;
+      if (questions.length > 0) break;
+      await sleep(100);
+    }
+    assert.equal(questions.length, 1);
+    assert.equal(questions[0].kind, 'permission');
+
+    const answer = await fetch(
+      `${harness.base}/admin/api/questions/${questions[0].id}/answer`,
+      {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${harness.adminToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ decision: 'once' }),
+      },
+    );
+    assert.equal(answer.status, 200);
+    const sse = await bodyPromise;
+    assert.match(sse, /permission handled/);
+    assert.deepEqual(fake.decisions, ['once']);
+    // kilo 必须走 v2 /session/:id/permissions/:permissionID（body { response }）。
+    assert.deepEqual(fake.permissionReplies, [
+      {
+        sessionID: fake.permissionSession,
+        permissionID: 'per_fake_1',
+        response: 'once',
+      },
+    ]);
+    const pending = await adminGet(harness, '/admin/api/questions');
+    assert.equal(pending.questions.length, 0);
   } finally {
     await harness.close();
     await fake.close();

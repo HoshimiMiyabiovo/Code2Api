@@ -18,6 +18,8 @@ export interface UpstreamModelInfo {
   id: string;
   /** 上游声明的上下文窗口（如有）。 */
   contextWindow?: number;
+  /** 上游声明的最大输出 tokens（如有）。 */
+  maxOutputTokens?: number;
   /** 上游声明支持的能力（如 supported_parameters / modalities）。 */
   capabilities?: DetectedCapabilities;
 }

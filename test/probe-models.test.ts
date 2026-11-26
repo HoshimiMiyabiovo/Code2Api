@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.js';
@@ -216,6 +216,44 @@ test('探测端点：openai-compatible 草稿拉取 /models，不污染 registry
   }
 });
 
+test('探测端点：openai-compatible free_only 只返回显式免费模型', async () => {
+  const fake = await startFakeModels([
+    {
+      id: 'free-model',
+      isFree: true,
+      context_length: 131072,
+      max_completion_tokens: 8192,
+      supported_parameters: ['reasoning'],
+    },
+    { id: 'paid-model', isFree: false },
+    { id: 'unknown-model' },
+  ]);
+  const harness = await startGateway();
+  try {
+    const probe = await adminJson(harness, '/admin/api/channels/probe-models', {
+      method: 'POST',
+      body: {
+        id: 'probe-kilo',
+        type: 'openai-compatible',
+        baseUrl: `${fake.baseUrl}/v1`,
+        freeOnly: true,
+        keys: [],
+        models: [],
+      },
+    });
+    assert.equal(probe.status, 200);
+    assert.deepEqual(
+      probe.body.models.map((m: any) => m.id),
+      ['free-model'],
+    );
+    assert.equal(probe.body.models[0].contextWindow, 131072);
+    assert.equal(probe.body.models[0].maxOutputTokens, 8192);
+  } finally {
+    await harness.close();
+    await fake.close();
+  }
+});
+
 test('探测端点：opencode 草稿拉取 /api/model 并过滤残影，回填 upstream', async () => {
   const fake = new FakeOpenCodeModels([
     {
@@ -379,6 +417,59 @@ test('探测端点：zcode 无模型目录返回明确提示，缺 id / base_url
     assert.equal(noBaseUrl.status, 400);
     assert.match(noBaseUrl.body.error.message, /base_url/);
   } finally {
+    await harness.close();
+  }
+});
+
+test('探测端点：qoder 渠道经 daemon.get_models 返回模型目录，只读不建会话', async () => {
+  const harness = await startGateway();
+  const dir = mkdtempSync(join(tmpdir(), 'code2api-qoder-probe-'));
+  const scenarioPath = join(dir, 'scenario.json').replaceAll('\\', '/');
+  const statePath = join(dir, 'state.json').replaceAll('\\', '/');
+  writeFileSync(scenarioPath, JSON.stringify({ stateFile: statePath }), 'utf8');
+  try {
+    const probe = await adminJson(harness, '/admin/api/channels/probe-models', {
+      method: 'POST',
+      body: {
+        id: 'probe-qd',
+        type: 'qoder',
+        command: process.execPath,
+        args: [join(import.meta.dirname, 'fake-qoder-server.cjs'), scenarioPath],
+        env: { ELECTRON_RUN_AS_NODE: '1' },
+        models: [],
+      },
+    });
+    assert.equal(probe.status, 200, JSON.stringify(probe.body));
+    const models: any[] = probe.body.models;
+    // fake 目录 3 条，其中 isEnabled:false 的不进候选
+    assert.equal(models.length, 2);
+    const first = models.find((model) => model.id === 'fake-qoder-model');
+    assert.ok(first);
+    // 对外名与 upstream 都是 runtime 的 modelId（open_session --model 直接用）
+    assert.equal(first.upstream, 'fake-qoder-model');
+    assert.equal(first.contextWindow, 200000);
+    assert.equal(first.maxOutputTokens, 32000);
+    assert.equal(first.capabilities.reasoning, true);
+    assert.equal(first.capabilities.vision, true);
+    assert.equal(first.default, true);
+    assert.match(first.label, /Fake Qoder/);
+
+    // 探测是只读目录：全程没有 open_session / 用户消息
+    const deadline = Date.now() + 5000;
+    let state: any = null;
+    while (Date.now() < deadline) {
+      try {
+        state = JSON.parse(readFileSync(statePath, 'utf8'));
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    assert.ok(state);
+    assert.deepEqual(state.sessionArgs, []);
+    assert.deepEqual(state.prompts, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
     await harness.close();
   }
 });

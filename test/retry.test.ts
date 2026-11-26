@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { loadConfig } from '../src/config.js';
 import { createGateway, type Gateway } from '../src/http/app.js';
 
-type Reply = '429' | '429-retry' | '400' | '200' | 'stream';
+type Reply = '429' | '429-retry' | '400' | '200' | 'stream' | 'hang';
 
 interface FakeUpstream {
   baseUrl: string;
@@ -43,6 +43,10 @@ function startFake(sequence: Reply[]): Promise<FakeUpstream> {
     }
     calls.push(Date.now());
     const reply = sequence[Math.min(calls.length - 1, sequence.length - 1)] ?? '200';
+    if (reply === 'hang') {
+      // 故意不响应：模拟上游挂起，由网关的 ttfb 超时主动断开
+      return;
+    }
     if (reply === '429') {
       res.writeHead(429, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: { message: 'rate limited' } }));
@@ -139,8 +143,10 @@ function configFor(
   fake: FakeUpstream,
   options: {
     rateLimitCooldownMs?: number;
+    networkCooldownMs?: number;
     maxRetries?: number;
     maxTotalWaitMs?: number;
+    ttfbMs?: number;
   } = {},
 ): string {
   return `
@@ -158,6 +164,7 @@ routing:
   max_attempts: 1
   cooldowns:
     rate_limit_ms: ${options.rateLimitCooldownMs ?? 50}
+    network_ms: ${options.networkCooldownMs ?? 10000}
   retry:
     enabled: true
     max_retries: ${options.maxRetries ?? 2}
@@ -171,6 +178,11 @@ providers:
   - id: fake
     type: openai-compatible
     base_url: ${fake.baseUrl}/v1
+    timeouts:
+      connect_ms: 1000
+      ttfb_ms: ${options.ttfbMs ?? 60000}
+      idle_ms: 120000
+      total_ms: 600000
     keys:
       - label: main
         key: ok-key
@@ -385,6 +397,38 @@ test('冷却剩余超出等待预算时立即 503 且错误信息带诊断', asy
     assert.match(
       String(second.body?.error?.message ?? ''),
       /当前无可用渠道（渠道冷却剩余时长超出单请求等待预算，本轮未尝试上游）/,
+    );
+  } finally {
+    await harness.close();
+    await fake.close();
+  }
+});
+
+test('上游持续超时时按墙钟预算快速失败（尝试耗时计入预算）', async () => {
+  const fake = await startFake(['hang']);
+  const harness = await startGateway(
+    configFor(fake, {
+      networkCooldownMs: 100,
+      maxRetries: 5,
+      maxTotalWaitMs: 300,
+      ttfbMs: 60,
+    }),
+  );
+  try {
+    const started = Date.now();
+    const response = await chat(harness, {
+      model: 'm',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const elapsed = Date.now() - started;
+    assert.equal(response.status, 504);
+    // 旧语义（只计睡眠）：waitedMs 返在预算内会继续重试第 3 次；
+    // 墙钟预算下两次 60ms 超时后已越线 → 最多 2 次尝试即报错。
+    assert.ok(fake.calls() <= 2, `expected ≤2 attempts, got ${fake.calls()}`);
+    assert.ok(elapsed < 2000, `expected fast failure, took ${elapsed}ms`);
+    assert.match(
+      String(response.body?.error?.message ?? ''),
+      /所有渠道均失败/,
     );
   } finally {
     await harness.close();

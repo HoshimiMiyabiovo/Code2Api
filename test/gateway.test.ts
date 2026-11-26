@@ -447,6 +447,96 @@ providers:
   }
 });
 
+test('一键清空冷却：admin API 解除密钥冷却并恢复路由', async () => {
+  const fake = await startFakeUpstream();
+  const harness = await startGateway(`
+server:
+  port: 0
+admin:
+  token: test-admin
+storage:
+  path: __DB__
+providers:
+  - id: fake-a
+    type: openai-compatible
+    priority: 10
+    base_url: ${fake.baseUrl}/v1
+    keys:
+      - label: bad
+        key: bad-key
+    models:
+      - id: shared-model
+        upstream: upstream-model
+  - id: fake-b
+    type: openai-compatible
+    priority: 20
+    base_url: ${fake.baseUrl}/v1
+    keys:
+      - label: good
+        key: ok-key
+    models:
+      - id: shared-model
+        upstream: upstream-model
+`);
+  try {
+    const chat = () =>
+      fetch(`${harness.base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'shared-model',
+          messages: [{ role: 'user', content: 'clear-cooldown' }],
+        }),
+      });
+
+    // 第一次请求：fake-a 密钥被打入冷却，请求 failover 到 fake-b
+    const first = await chat();
+    assert.equal(first.status, 200);
+    let overview = await adminGet(harness, '/admin/api/overview?range=24h');
+    let providerA = overview.providers.find((p: any) => p.id === 'fake-a');
+    assert.equal(providerA.keys[0].status, 'cooling');
+    assert.ok(providerA.keys[0].cooldownRemainingMs > 0);
+
+    // 未授权访问被拒绝
+    const unauth = await fetch(`${harness.base}/admin/api/maintenance/clear-cooldowns`, {
+      method: 'POST',
+    });
+    assert.equal(unauth.status, 401);
+
+    // 清空冷却：只有 fake-a 的密钥处于冷却中
+    const cleared = await adminSend(harness, '/admin/api/maintenance/clear-cooldowns', 'POST');
+    assert.equal(cleared.status, 200);
+    assert.equal(cleared.body.cleared, 1);
+
+    overview = await adminGet(harness, '/admin/api/overview?range=24h');
+    providerA = overview.providers.find((p: any) => p.id === 'fake-a');
+    assert.equal(providerA.keys[0].status, 'ready');
+    assert.equal(providerA.keys[0].cooldownRemainingMs, 0);
+
+    // 没有冷却可清时返回 0
+    const again = await adminSend(harness, '/admin/api/maintenance/clear-cooldowns', 'POST');
+    assert.equal(again.status, 200);
+    assert.equal(again.body.cleared, 0);
+
+    // 清空后 fake-a 重新参与路由：仍失败但错误计数增加（证明不再被跳过）
+    const second = await chat();
+    assert.equal(second.status, 200);
+    overview = await adminGet(harness, '/admin/api/overview?range=24h');
+    providerA = overview.providers.find((p: any) => p.id === 'fake-a');
+    const providerB = overview.providers.find((p: any) => p.id === 'fake-b');
+    assert.equal(providerA.stats.errors, 2);
+    assert.equal(providerB.stats.requests, 2);
+    assert.equal(providerA.keys[0].status, 'cooling');
+
+    const latest = await adminGet(harness, '/admin/api/requests?range=24h&limit=10');
+    assert.equal(latest.requests[0].provider, 'fake-b');
+    assert.equal(latest.requests[0].status, 'ok');
+  } finally {
+    await harness.close();
+    await fake.close();
+  }
+});
+
 test('流式：上游拒绝 stream_options 时自动降级重试', async () => {
   const fake = await startFakeUpstream({ rejectStreamOptions: true });
   const harness = await startGateway(`

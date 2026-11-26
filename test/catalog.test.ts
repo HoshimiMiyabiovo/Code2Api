@@ -10,7 +10,15 @@ import { createGateway, type Gateway } from '../src/http/app.js';
 
 interface FakeOptions {
   models?: Array<
-    string | { id: string; context_length?: number; supported_parameters?: string[] }
+    | string
+    | {
+        id: string;
+        context_length?: number;
+        supported_parameters?: string[];
+        isFree?: boolean;
+        max_completion_tokens?: number;
+        top_provider?: { context_length?: number; max_completion_tokens?: number };
+      }
   >;
   rejectReasoning?: boolean;
 }
@@ -42,6 +50,9 @@ async function startFake(options: FakeOptions = {}): Promise<FakeUpstream> {
               owned_by: 'fake',
               context_length: item.context_length,
               supported_parameters: item.supported_parameters,
+              isFree: item.isFree,
+              max_completion_tokens: item.max_completion_tokens,
+              top_provider: item.top_provider,
             },
       );
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -297,6 +308,83 @@ providers:
     });
     assert.equal(routed.status, 200);
     assert.equal(fake.bodies.at(-1)?.model, 'gpt-5');
+  } finally {
+    await harness.close();
+    await fake.close();
+  }
+});
+
+test('Kilo：free_only 过滤自动模型，reasoning 对象与目录上限生效', async () => {
+  const fake = await startFake({
+    models: [
+      {
+        id: 'kilo-free',
+        isFree: true,
+        supported_parameters: ['tools', 'reasoning'],
+        top_provider: { context_length: 200000, max_completion_tokens: 8192 },
+      },
+      { id: 'kilo-paid', isFree: false },
+      { id: 'kilo-unknown' },
+    ],
+  });
+  const harness = await startGateway(`
+server:
+  port: 0
+admin:
+  token: test-admin
+storage:
+  path: __DB__
+catalog:
+  sync_enabled: true
+  sync_on_start: true
+providers:
+  - id: kilo
+    type: openai-compatible
+    base_url: ${fake.baseUrl}/v1
+    free_only: true
+    reasoning_field: reasoning.effort
+    reasoning_off_field: reasoning.enabled
+    keys:
+      - label: good
+        key: ok-key
+    models:
+      - id: manual
+        upstream: kilo-paid
+        capabilities:
+          tools: true
+`);
+  try {
+    const models = await fetch(`${harness.base}/v1/models`).then((r) => r.json());
+    assert.deepEqual(
+      models.data.map((m: any) => m.id).sort(),
+      ['kilo-free', 'manual'],
+    );
+    const admin = await adminGet(harness, '/admin/api/models');
+    const free = admin.models.find((m: any) => m.id === 'kilo-free');
+    assert.equal(free.contextWindow, 200000);
+    assert.equal(free.maxOutputTokens, 8192);
+    assert.equal(free.capabilities.reasoning, true);
+    assert.ok(admin.models.find((m: any) => m.id === 'manual' && m.source === 'config'));
+
+    const high = await chat(harness, {
+      model: 'kilo-free',
+      reasoning_effort: 'high',
+      max_tokens: 100000,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(high.status, 200);
+    assert.equal(fake.bodies.at(-1)?.max_tokens, 8192);
+    assert.deepEqual(fake.bodies.at(-1)?.reasoning, { effort: 'high' });
+    assert.equal(fake.bodies.at(-1)?.reasoning_effort, undefined);
+
+    const off = await chat(harness, {
+      model: 'kilo-free',
+      reasoning_effort: 'disabled',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(off.status, 200);
+    assert.deepEqual(fake.bodies.at(-1)?.reasoning, { enabled: false });
+    assert.equal(fake.bodies.at(-1)?.reasoning_effort, undefined);
   } finally {
     await harness.close();
     await fake.close();

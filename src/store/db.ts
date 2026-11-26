@@ -97,7 +97,7 @@ export interface OcQuestionRow {
   gatewaySessionId: string;
   providerId: string;
   ocSessionId: string;
-  kind: 'form' | 'permission';
+  kind: 'form' | 'permission' | 'question';
   requestId: string;
   payload: unknown;
   status: string;
@@ -131,7 +131,7 @@ export interface ZcQuestionRow {
   gatewaySessionId: string;
   providerId: string;
   zcSessionId: string;
-  kind: 'form' | 'permission';
+  kind: 'form' | 'permission' | 'question';
   requestId: string;
   payload: unknown;
   status: string;
@@ -165,7 +165,7 @@ export interface QdQuestionRow {
   gatewaySessionId: string;
   providerId: string;
   qdSessionId: string;
-  kind: 'form' | 'permission';
+  kind: 'form' | 'permission' | 'question';
   requestId: string;
   payload: unknown;
   status: string;
@@ -980,7 +980,7 @@ export class Store {
     gatewaySessionId: string;
     providerId: string;
     ocSessionId: string;
-    kind: 'form' | 'permission';
+    kind: 'form' | 'permission' | 'question';
     requestId: string;
     payload: unknown;
   }): void {
@@ -1019,7 +1019,7 @@ export class Store {
       gatewaySessionId: String(row.gateway_session_id),
       providerId: String(row.provider_id),
       ocSessionId: String(row.oc_session_id),
-      kind: String(row.kind) as 'form' | 'permission',
+      kind: String(row.kind) as 'form' | 'permission' | 'question',
       requestId: String(row.request_id),
       payload: safeJson(row.payload),
       status: String(row.status),
@@ -1447,7 +1447,7 @@ export class Store {
     gatewaySessionId: string;
     providerId: string;
     qdSessionId: string;
-    kind: 'form' | 'permission';
+    kind: 'form' | 'permission' | 'question';
     requestId: string;
     payload: unknown;
   }): void {

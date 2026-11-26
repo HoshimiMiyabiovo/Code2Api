@@ -208,6 +208,8 @@ test('qoder 任务级：非流式、流式、增量去重与 oneshot 收尾', as
 
     const state = await readState(harness);
     assert.deepEqual(state.prompts, ['hello-1', 'hello-2', 'hello-oneshot']);
+    // daemon.list_sessions 返回 local_session_id：复用会话不能每轮重建，只有 oneshot 新开
+    assert.equal(state.sessionArgs.length, 2, '复用会话不应重建；oneshot 才新开');
     // open_session 携带 --model / --permission-mode / --include-partial-messages
     const open = state.sessionArgs[0];
     assert.ok(open.worker_args.includes('fake-qoder-provider/fake-model'));
@@ -437,6 +439,8 @@ test('qoder 渠道健康与监控视图', async () => {
     assert.ok(Array.isArray(provider.qoder.args));
     assert.equal(provider.qoder.mode, 'bypass_permissions');
     assert.equal(provider.qoder.worker.state, 'ready');
+    assert.equal(provider.qoder.worker.auth.authenticated, true);
+    assert.equal(provider.qoder.worker.auth.method, 'qodercli');
     assert.ok(provider.qoder.pool);
     assert.ok(provider.qoder.pool.maxSessions >= 2);
   } finally {
@@ -464,6 +468,26 @@ test('qoder 渠道 env 配置注入 CLI 子进程', async () => {
     assert.equal(data.cliEnv.QODER_PERSONAL_ACCESS_TOKEN, 'fake-pat-token');
     // 网关强制注入 daemon 模式标记
     assert.equal(data.cliEnv.QODER_AGENT_SDK_DAEMON, '1');
+    // 真实 runtime 不读这个 env；网关必须显式走 daemon.authenticate 的 accessToken
+    assert.deepEqual(data.auth[0], {
+      type: 'accessToken',
+      accessToken: 'fake-pat-token',
+    });
+  } finally {
+    await harness.close();
+  }
+});
+
+test('qoder 无 PAT 时回退到 qodercli 本地登录态', async () => {
+  const harness = await startGateway({ scenario: { deltas: ['ok'] } });
+  try {
+    const response = await chat(harness, {
+      model: 'qd-test',
+      messages: [{ role: 'user', content: 'ping' }],
+    });
+    assert.equal(response.status, 200);
+    const data = await readState(harness);
+    assert.deepEqual(data.auth[0], { type: 'qodercli' });
   } finally {
     await harness.close();
   }
@@ -481,7 +505,40 @@ test('qoder daemon 认证失败时按 CLI 契约报错', async () => {
     assert.equal(response.status, 502);
     const body = await response.json();
     assert.match(body.error.message, /auth failed/);
+    const data = await readState(harness);
+    assert.equal(data.auth.length, 1);
   } finally {
     await harness.close();
+  }
+});
+
+test('qoder 无本地 CLI 凭据时错误给出登录指引', async () => {
+  const emptyHome = mkdtempSync(join(tmpdir(), 'code2api-qoder-empty-'));
+  const previousConfig = process.env.QODER_CONFIG_DIR;
+  const previousHome = process.env.QODER_HOME;
+  process.env.QODER_CONFIG_DIR = emptyHome;
+  process.env.QODER_HOME = emptyHome;
+  let harness: Harness | null = null;
+  try {
+    harness = await startGateway({
+      scenario: { authError: true, deltas: ['nope'] },
+    });
+    const response = await chat(harness, {
+      model: 'qd-test',
+      messages: [{ role: 'user', content: 'ping' }],
+    });
+    assert.equal(response.status, 502);
+    const body = await response.json();
+    assert.match(body.error.message, /IDE 登录不等于 CLI 登录/);
+    assert.match(body.error.message, /qoder-cli-credentials\.json/);
+    const data = await readState(harness);
+    assert.equal(data.auth.length, 1);
+  } finally {
+    if (harness) await harness.close();
+    if (previousConfig === undefined) delete process.env.QODER_CONFIG_DIR;
+    else process.env.QODER_CONFIG_DIR = previousConfig;
+    if (previousHome === undefined) delete process.env.QODER_HOME;
+    else process.env.QODER_HOME = previousHome;
+    rmSync(emptyHome, { recursive: true, force: true });
   }
 });

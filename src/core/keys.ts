@@ -113,7 +113,11 @@ export class KeyPool {
     const base = baseCooldownMs(category, cooldowns);
     if (base <= 0) return;
     key.consecutiveFailures += 1;
-    const exponent = Math.min(key.consecutiveFailures - 1, 3);
+    // 指数递增只用于 429（配置注释的原始语义）：超时/网络/5xx 属于上游故障，
+    // 若也翻倍，单 key 渠道连续挂几轮后一次冷却可达 80~120s，
+    // 叠加重试预算会把单个请求放大成数分钟的“卡死”。
+    const exponent =
+      category === 'rate_limit' ? Math.min(key.consecutiveFailures - 1, 3) : 0;
     const backoff = Math.min(base * 2 ** exponent, cooldowns.maxMs);
     // 上游明确给出 Retry-After 时直接采用（仍受 maxMs 封顶），
     // 不再与指数翻倍取 max——否则上游的小窗口会被本地滚雪球放大。
@@ -132,6 +136,18 @@ export class KeyPool {
       if (earliest === null || key.cooldownUntil < earliest) earliest = key.cooldownUntil;
     }
     return earliest;
+  }
+
+  /** 立即解除所有密钥的冷却与连续失败计数，返回被清空的密钥数量。 */
+  clearCooldowns(): number {
+    const source = this.noAuthKey ? [this.noAuthKey] : this.keys;
+    let cleared = 0;
+    for (const key of source) {
+      if (key.cooldownUntil > 0) cleared += 1;
+      key.cooldownUntil = 0;
+      key.consecutiveFailures = 0;
+    }
+    return cleared;
   }
 
   hasUsableKey(): boolean {

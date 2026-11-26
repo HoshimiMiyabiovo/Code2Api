@@ -6,6 +6,7 @@ export type FailureCategory =
   | 'network'
   | 'timeout'
   | 'empty_stream'
+  | 'stream_cut'
   | 'bad_request'
   | 'model_not_found'
   | 'busy'

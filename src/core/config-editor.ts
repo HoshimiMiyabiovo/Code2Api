@@ -89,6 +89,7 @@ const channelInputSchema = z.object({
   tokenLimitField: z.enum(['max_tokens', 'max_completion_tokens']).default('max_tokens'),
   sendStreamOptions: z.boolean().default(true),
   syncModels: z.boolean().default(true),
+  freeOnly: z.boolean().optional(),
   modelsUrl: z
     .string()
     .trim()
@@ -111,6 +112,8 @@ const channelInputSchema = z.object({
     .regex(/^[A-Za-z0-9-]*$/, '会话头名称仅支持字母、数字和连字符')
     .optional(),
   defaultReasoningEffort: z.string().trim().min(1).max(32).optional(),
+  reasoningField: z.string().trim().max(128).optional(),
+  reasoningOffField: z.string().trim().max(128).optional(),
   reasoningBudgetField: z.string().trim().min(1).max(128).optional(),
   command: z.string().trim().min(1).max(1024).optional(),
   args: z.array(z.string().trim().min(1).max(2048)).max(32).optional(),
@@ -472,11 +475,8 @@ export function buildProvider(input: ChannelInput, existing?: ProviderConfig): P
   }
   if (input.type === 'qoder') {
     if (input.keys.length > 0) bad('qoder 渠道不需要密钥');
-    for (const model of models) {
-      if (!model.upstream.includes('/')) {
-        bad(`qoder 模型 ${model.id} 的 upstream 必须是 providerId/modelId`);
-      }
-    }
+    // Qoder 的 model 引用既可以是 providerId/modelKey，也可以直接是模型 key
+    // （runtime 的 resolveRef：没有 "/" 时用默认 provider）。不要强制要求斜杠。
     if (input.mode && !QODER_MODES.includes(input.mode)) {
       bad(`qoder 渠道 mode 仅支持 ${QODER_MODES.join(' / ')}`);
     }
@@ -525,7 +525,16 @@ export function buildProvider(input: ChannelInput, existing?: ProviderConfig): P
     modelPrefixes: input.modelPrefixes ?? existingOa?.modelPrefixes,
     timeouts: existingOa?.timeouts ?? DEFAULT_TIMEOUTS,
     syncModels: existingOa?.syncModels ?? true,
+    freeOnly: input.freeOnly ?? existingOa?.freeOnly ?? false,
     defaultReasoningEffort: existingOa?.defaultReasoningEffort,
+    reasoningField:
+      input.reasoningField !== undefined
+        ? input.reasoningField || undefined
+        : existingOa?.reasoningField,
+    reasoningOffField:
+      input.reasoningOffField !== undefined
+        ? input.reasoningOffField || undefined
+        : existingOa?.reasoningOffField,
     reasoningBudgetField: existingOa?.reasoningBudgetField,
     quota: existingOa?.quota,
     keepalive: existingOa?.keepalive,
@@ -576,6 +585,7 @@ function providerToRaw(provider: ProviderConfig): Record<string, unknown> {
     raw.token_limit_field = provider.tokenLimitField;
     raw.send_stream_options = provider.sendStreamOptions;
     raw.sync_models = provider.syncModels;
+    raw.free_only = provider.freeOnly;
     if (provider.userAgent) raw.user_agent = provider.userAgent;
     if (provider.modelsUrl) raw.models_url = provider.modelsUrl;
     if (provider.sessionHeader) raw.session_header = provider.sessionHeader;
@@ -585,6 +595,8 @@ function providerToRaw(provider: ProviderConfig): Record<string, unknown> {
     if (provider.defaultReasoningEffort) {
       raw.default_reasoning_effort = provider.defaultReasoningEffort;
     }
+    if (provider.reasoningField) raw.reasoning_field = provider.reasoningField;
+    if (provider.reasoningOffField) raw.reasoning_off_field = provider.reasoningOffField;
     if (provider.reasoningBudgetField) {
       raw.reasoning_budget_field = provider.reasoningBudgetField;
     }

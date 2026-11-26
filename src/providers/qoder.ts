@@ -19,6 +19,7 @@ import {
 } from './opencode.js';
 import {
   QoderWorker,
+  type QoderModelInfo,
   type QoderProtocolFrame,
   type QoderServerRequest,
   type QoderWorkerSnapshot,
@@ -115,6 +116,25 @@ function assistantTextOf(frame: QoderProtocolFrame): string {
     }
   }
   return texts.join('');
+}
+
+/**
+ * 面板「探测上游」：用草稿配置临时拉起一个 qoder daemon，读一次 daemon.get_models 后关停。
+ * 只读目录、不 open_session、不消耗模型额度；未保存的渠道也能探测。
+ */
+export async function probeQoderModels(
+  config: QoderProviderConfig,
+  timeoutMs = 20000,
+): Promise<QoderModelInfo[]> {
+  const worker = new QoderWorker(config);
+  try {
+    await worker.ensureStarted();
+    return await worker.getModels({ timeoutMs });
+  } finally {
+    await worker.stop().catch(() => {
+      // 探测收尾失败不影响结果；进程已被 killChild 兜底
+    });
+  }
 }
 
 export class QoderAdapter implements ProviderAdapter {
@@ -1053,11 +1073,12 @@ export class QoderAdapter implements ProviderAdapter {
       if (unsubscribeExit) unsubscribeExit();
       this.activeSessions.delete(gatewaySessionId);
       if (runtime?.oneShot) {
+        // 真实 daemon 从 control_request 信封读 session_id（payload 里的同名字段只是兼容 fake/旧版）。
         void runtime.worker
           .request(
             'daemon.close_session',
             { session_id: runtime.qdSessionId },
-            { timeoutMs: 10000 },
+            { sessionId: runtime.qdSessionId, timeoutMs: 10000 },
           )
           .catch(() => {});
         this.store.deleteQdSession(gatewaySessionId, this.config.id);
@@ -1082,7 +1103,10 @@ function extractSessionIds(result: Record<string, unknown>): string[] | undefine
       ids.push(item);
     } else if (item && typeof item === 'object') {
       const rec = item as Record<string, unknown>;
-      const id = rec.session_id ?? rec.sessionId ?? rec.id;
+      // 0.5.17 daemon.list_sessions 返回 {sessions:[{local_session_id,...}]}；
+      // 其余字段名是旧版/fake 兼容。
+      const id =
+        rec.local_session_id ?? rec.session_id ?? rec.sessionId ?? rec.id;
       if (typeof id === 'string') ids.push(id);
     }
   }

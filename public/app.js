@@ -470,10 +470,15 @@
         else statusCell.append(chip('已停止', 'idle'));
         if (worker) {
           const logTail = Array.isArray(worker.logTail) ? worker.logTail.slice(-5) : [];
+          const auth = worker.auth;
           statusCell.title = [
             worker.mode === 'external' ? '外部服务' : '本地进程',
             worker.pid ? `PID ${worker.pid}` : '',
             worker.baseUrl ?? worker.workspace ?? '',
+            auth?.method
+              ? `认证: ${auth.authenticated === true ? 'OK' : auth.authenticated === false ? '失败' : '未知'} (${auth.method})`
+              : '',
+            auth?.error ?? '',
             worker.lastError ?? '',
             logTail.length ? `stderr: ${logTail.join(' | ').slice(0, 300)}` : '',
           ]
@@ -721,16 +726,31 @@
       const title =
         question.kind === 'form'
           ? String(question.payload?.title || '需要确认')
-          : `审批：${String(question.payload?.action || '工具调用')}`;
+          : question.kind === 'question'
+            ? `模型提问：${String(question.payload?.questions?.[0]?.header || '需要回答')}`
+            : `审批：${String(question.payload?.action || '工具调用')}`;
       info.append(el('div', 'question-title', title));
+      const kindLabel =
+        question.kind === 'form'
+          ? '确认'
+          : question.kind === 'question'
+            ? '提问'
+            : '审批';
       info.append(
         el(
           'div',
           'question-meta',
-          `${question.providerId} · ${question.gatewaySessionId} · ${question.kind === 'form' ? '确认' : '审批'}`,
+          `${question.providerId} · ${question.gatewaySessionId} · ${kindLabel}`,
         ),
       );
-      head.append(info, chip(question.kind === 'form' ? '等待回答' : '等待审批', 'warn'));
+      head.append(info, chip(
+        question.kind === 'form'
+          ? '等待回答'
+          : question.kind === 'question'
+            ? '等待回答'
+            : '等待审批',
+        'warn',
+      ));
       card.append(head);
 
       if (question.kind === 'permission') {
@@ -754,6 +774,36 @@
           actions.append(button);
         }
         card.append(actions);
+      } else if (question.kind === 'question') {
+        // kilo question 工具：payload.questions 为问题数组，回答按顺序提交
+        // { answers: string[][] }（每项是该问题的选中标签数组）。
+        const items = Array.isArray(question.payload?.questions)
+          ? question.payload.questions
+          : [];
+        const container = el('div', 'question-fields');
+        for (const [index, item] of items.entries()) {
+          container.append(buildQuestionItem(index, item, items.length));
+        }
+        card.append(container);
+        const actions = el('div', 'question-actions');
+        const submit = el('button', 'primary mini', '提交回答');
+        submit.type = 'button';
+        submit.addEventListener('click', () => {
+          try {
+            const answers = collectQuestionAnswers(items, container);
+            void answerQuestion(question.id, { answers }, submit);
+          } catch (error) {
+            showToast(error.message);
+          }
+        });
+        actions.append(submit);
+        const reject = el('button', 'mini danger', '拒绝回答');
+        reject.type = 'button';
+        reject.addEventListener('click', () =>
+          void answerQuestion(question.id, { reject: true }, reject),
+        );
+        actions.append(reject);
+        card.append(actions);
       } else {
         const fields = Array.isArray(question.payload?.fields) ? question.payload.fields : [];
         const container = el('div', 'question-fields');
@@ -775,6 +825,64 @@
       }
       questionsList.append(card);
     }
+  }
+
+  function buildQuestionItem(index, item, total) {
+    const block = el('div', 'question-item');
+    block.dataset.questionIndex = String(index);
+    const heading = el('div', 'question-title', String(item?.header || `问题 ${index + 1}`));
+    if (total > 1) {
+      heading.append(el('span', 'question-meta', `（${index + 1}/${total}）`));
+    }
+    block.append(heading);
+    if (item?.question) {
+      block.append(el('div', 'question-meta', String(item.question)));
+    }
+    const options = Array.isArray(item?.options) ? item.options : [];
+    if (options.length > 0) {
+      const wrap = el('div', 'caps-row');
+      for (const option of options) {
+        const optionLabel = el('label');
+        const input = el('input', 'q-choice');
+        input.type = item?.multiple ? 'checkbox' : 'radio';
+        input.name = `q-${index}`;
+        input.value = String(option.label ?? '');
+        optionLabel.append(input, document.createTextNode(String(option.label ?? '')));
+        if (option.description) {
+          optionLabel.title = String(option.description);
+        }
+        wrap.append(optionLabel);
+      }
+      block.append(wrap);
+    }
+    if (item?.custom) {
+      const input = el('input', 'q-custom-text');
+      input.type = 'text';
+      input.placeholder = '自定义回答…';
+      block.append(input);
+    }
+    return block;
+  }
+
+  function collectQuestionAnswers(items, container) {
+    const answers = [];
+    for (const [index] of items.entries()) {
+      const block = container.querySelector(`[data-question-index="${index}"]`);
+      if (!block) {
+        answers.push([]);
+        continue;
+      }
+      const picked = [...block.querySelectorAll('.q-choice:checked')].map(
+        (input) => input.value,
+      );
+      const custom = block.querySelector('.q-custom-text')?.value.trim();
+      if (custom) picked.push(custom);
+      answers.push(picked);
+    }
+    if (answers.every((picked) => picked.length === 0)) {
+      throw new Error('请至少回答一个问题');
+    }
+    return answers;
   }
 
   async function answerQuestion(id, payload, button) {
@@ -988,7 +1096,7 @@
       refreshSelectedOptionText();
     });
     const upstreamInput = el('input', 'm-upstream');
-    upstreamInput.placeholder = '上游名；opencode 填 providerID/modelID';
+    upstreamInput.placeholder = '上游名；opencode 填 providerID/modelID，qoder 填模型 key（留空=同模型 ID）';
     upstreamInput.value = model.upstream ?? '';
     upstreamInput.autocomplete = 'off';
     upstreamInput.setAttribute('list', 'upstream-options');
@@ -1107,8 +1215,14 @@
     const model = state.editingModels[state.selectedModelIndex];
     const option = modelPicker.querySelector(`option[value="${state.selectedModelIndex}"]`);
     if (!model || !option) return;
-    option.textContent =
-      model.id + (model.upstream && model.upstream !== model.id ? ` → ${model.upstream}` : '');
+    option.textContent = modelOptionLabel(model);
+  }
+
+  /** 模型下拉的显示文本：未起名的模型显示占位，避免下拉框一片空白像坏掉了。 */
+  function modelOptionLabel(model) {
+    if (!model) return '';
+    const name = String(model.id ?? '').trim() || '（未命名模型）';
+    return model.upstream && model.upstream !== model.id ? `${name} → ${model.upstream}` : name;
   }
 
   function renderModelPicker() {
@@ -1124,8 +1238,7 @@
       for (const model of list) {
         const option = el('option');
         option.value = String(state.editingModels.indexOf(model));
-        option.textContent =
-          model.id + (model.upstream && model.upstream !== model.id ? ` → ${model.upstream}` : '');
+        option.textContent = modelOptionLabel(model);
         group.append(option);
       }
       modelPicker.append(group);
@@ -1133,6 +1246,10 @@
     modelPicker.value = String(state.selectedModelIndex);
     modelCount.textContent = `${state.editingModels.length} 个`;
     modelRemoveBtn.disabled = state.editingModels.length <= 1;
+    modelRemoveBtn.title =
+      state.editingModels.length <= 1
+        ? '至少保留一个模型；要换模型请直接改当前卡片，或先「添加模型」再移除旧的'
+        : '移除当前选中的模型';
   }
 
   function renderModelForm() {
@@ -1162,10 +1279,11 @@
     for (const node of document.querySelectorAll('#channel-dialog .cli-only')) {
       node.hidden = !(isOpenCode || isZcode || isQoder);
     }
-    // 只有 openai-compatible / opencode 具备上游模型目录；其余类型提示手填。
-    const probeSupported = isOpenAI || isOpenCode;
+    // openai-compatible / opencode / qoder 都能探测模型目录（qoder 走 daemon.get_models）；
+    // zcode 没有目录可探测，按手填处理。前缀规则只对能自动发现模型的 openai/opencode 生效。
+    const probeSupported = isOpenAI || isOpenCode || isQoder;
     probeModelsBtn.hidden = !probeSupported;
-    modelPrefixesRow.hidden = !probeSupported;
+    modelPrefixesRow.hidden = !(isOpenAI || isOpenCode);
     if (!probeSupported) {
       resetProbeState();
     }
@@ -1194,6 +1312,9 @@
     $('#ch-auth-header').value = channel?.authHeader ?? 'bearer';
     $('#ch-token-field').value = channel?.tokenLimitField ?? 'max_tokens';
     $('#ch-stream-options').checked = channel ? channel.sendStreamOptions !== false : true;
+    $('#ch-free-only').checked = channel?.freeOnly === true;
+    $('#ch-reasoning-field').value = channel?.reasoningField ?? '';
+    $('#ch-reasoning-off-field').value = channel?.reasoningOffField ?? '';
     $('#ch-models-url').value = channel?.modelsUrl ?? '';
     $('#ch-user-agent').value = channel?.userAgent ?? '';
     $('#ch-session-header').value = channel?.sessionHeader ?? '';
@@ -1391,6 +1512,9 @@
       payload.authHeader = $('#ch-auth-header').value;
       payload.tokenLimitField = $('#ch-token-field').value;
       payload.sendStreamOptions = $('#ch-stream-options').checked;
+      payload.freeOnly = $('#ch-free-only').checked;
+      payload.reasoningField = $('#ch-reasoning-field').value.trim();
+      payload.reasoningOffField = $('#ch-reasoning-off-field').value.trim();
       payload.modelsUrl = $('#ch-models-url').value.trim();
       payload.userAgent = $('#ch-user-agent').value.trim();
       payload.sessionHeader = $('#ch-session-header').value.trim();
@@ -1542,6 +1666,7 @@
 
   function probedModelMeta(candidate) {
     const parts = [];
+    if (candidate.label && candidate.id) parts.push(candidate.id);
     if (candidate.contextWindow) parts.push(`上下文 ${compactFmt.format(candidate.contextWindow)}`);
     if (candidate.maxOutputTokens) parts.push(`输出 ${compactFmt.format(candidate.maxOutputTokens)}`);
     const caps = candidate.capabilities ?? {};
@@ -1575,9 +1700,10 @@
       const pick = el('button', 'mini probe-pick');
       pick.type = 'button';
       pick.textContent =
-        candidate.upstream && candidate.upstream !== candidate.id
+        candidate.label ||
+        (candidate.upstream && candidate.upstream !== candidate.id
           ? `${candidate.id} → ${candidate.upstream}`
-          : candidate.id;
+          : candidate.id);
       const meta = el('span', 'muted probe-meta', probedModelMeta(candidate));
       pick.title = meta.textContent || pick.textContent;
       pick.addEventListener('click', () => applyProbedModel(candidate));
@@ -1642,7 +1768,9 @@
     setProbeStatus(
       type === 'opencode'
         ? '探测中…（opencode 需要拉起 CLI，可能需要几十秒）'
-        : '探测中…',
+        : type === 'qoder'
+          ? '探测中…（qoder 需要拉起 CLI 读取模型目录，可能需要十几秒）'
+          : '探测中…',
     );
     try {
       const payload = buildChannelPayload(true);
@@ -1669,7 +1797,11 @@
         const hint =
           type === 'opencode' && $('#ch-model-filter').value.trim()
             ? '；检查“模型过滤”白名单是否放行'
-            : '';
+            : type === 'openai-compatible' && $('#ch-free-only').checked
+              ? '；只保留上游显式标记 isFree:true 的模型'
+              : type === 'qoder'
+                ? '；检查 Qoder 是否已登录（daemon.authenticate 失败会写在渠道 worker 状态里）'
+                : '';
         setProbeStatus(`上游没有返回可用模型${hint}`);
       } else {
         setProbeStatus(
@@ -1721,9 +1853,29 @@
     } catch (error) {
       errorEl.textContent = error.message;
       errorEl.hidden = false;
+      // 同一校验错误重复触发时 DOM 不会有任何变化，补一条 toast，避免“点了没反应”。
+      showToast(error.message);
+      highlightInvalidField(error.message);
     } finally {
       saveButton.disabled = false;
     }
+  }
+
+  /** 把校验错误落到具体输入框：聚焦 + 红框 + 滚入可视区，而不是只在底部写一行字。 */
+  function highlightInvalidField(message) {
+    const card = modelsEditor.querySelector('.model-editor-row');
+    let target = null;
+    if (/模型 ID/.test(message)) target = card?.querySelector('.m-id') ?? null;
+    else if (/上下文窗口/.test(message)) target = card?.querySelector('.m-context') ?? null;
+    else if (/最大输出/.test(message)) target = card?.querySelector('.m-output') ?? null;
+    else if (/价格/.test(message)) target = card?.querySelector('.m-price-in') ?? null;
+    else if (/上游/.test(message)) target = card?.querySelector('.m-upstream') ?? null;
+    else if (/渠道 ID/.test(message)) target = $('#ch-id');
+    if (!target) return;
+    target.focus({ preventScroll: true });
+    target.classList.add('input-invalid');
+    window.setTimeout(() => target.classList.remove('input-invalid'), 2000);
+    target.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }
 
   async function deleteChannelById(id) {
@@ -2185,6 +2337,30 @@
   $('#keepalive-btn').addEventListener('click', () =>
     void runMaintenance('/admin/api/maintenance/keepalive', '保活已触发'),
   );
+  $('#clear-cooldowns-btn').addEventListener('click', async () => {
+    const button = $('#clear-cooldowns-btn');
+    button.disabled = true;
+    try {
+      const response = await fetch('/admin/api/maintenance/clear-cooldowns', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${state.token}` },
+      });
+      const body = await response.json().catch(() => ({}));
+      if (response.status === 401) {
+        setLoggedIn(false);
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(body?.error?.message || `操作失败（HTTP ${response.status}）`);
+      }
+      showToast(`已清空 ${body.cleared ?? 0} 个密钥的冷却`);
+      await refresh();
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  });
   $('#export-btn').addEventListener('click', () => void exportData());
   $('#channel-close').addEventListener('click', () => channelDialog.close());
   $('#channel-cancel').addEventListener('click', () => channelDialog.close());
@@ -2217,7 +2393,11 @@
     renderModelPicker();
     renderModelForm();
   });
-  $('#ch-type').addEventListener('change', updateChannelTypeVisibility);
+  $('#ch-type').addEventListener('change', () => {
+    // 换渠道类型后旧的探测候选不再适用，清掉避免误填到别的类型。
+    resetProbeState();
+    updateChannelTypeVisibility();
+  });
   $('#ch-opencode-go-preset').addEventListener('click', () => {
     $('#ch-base-url').value = 'https://opencode.ai/inference/go/openai/v1';
     $('#ch-models-url').value = 'https://opencode.ai/inference/go/v1/models';
@@ -2225,6 +2405,69 @@
     $('#ch-auth-header').value = 'bearer';
     if (!$('#ch-user-agent').value.trim()) {
       $('#ch-user-agent').value = 'code2api-gateway/1.0';
+    }
+  });
+  $('#ch-kilo-preset').addEventListener('click', () => {
+    $('#ch-base-url').value = 'https://ai-gateway.kilo.ai/api/v1';
+    $('#ch-models-url').value = '';
+    $('#ch-session-header').value = '';
+    $('#ch-free-only').checked = true;
+    $('#ch-reasoning-field').value = 'reasoning.effort';
+    $('#ch-reasoning-off-field').value = 'reasoning.enabled';
+    if (!state.editingChannelId) keysEditor.replaceChildren();
+  });
+  /**
+   * 检测到本机 Qoder 后自动读模型目录：用户不需要知道 upstream 叫什么。
+   * 当前模型卡片还没起名时，把 daemon 的默认模型（没有则第一个）直接填进去。
+   */
+  async function autoFillQoderModels() {
+    if (!$('#ch-id').value.trim()) {
+      setProbeStatus('先填渠道 ID，再点「探测上游」即可自动读取 Qoder 模型目录');
+      return;
+    }
+    await probeUpstreamModels();
+    if (!state.probedModels.length) return;
+    const current = state.editingModels[state.selectedModelIndex];
+    if (!current || current.id) return;
+    const preferred =
+      state.probedModels.find((candidate) => candidate.default) ?? state.probedModels[0];
+    applyProbedModel(preferred);
+    showToast(`已探测到 ${state.probedModels.length} 个 Qoder 模型，已预填 ${preferred.id}`);
+  }
+
+  $('#ch-qoder-detect').addEventListener('click', async () => {
+    const button = $('#ch-qoder-detect');
+    button.disabled = true;
+    try {
+      const response = await fetch('/admin/api/qoder/detect', {
+        headers: { authorization: `Bearer ${state.token}` },
+      });
+      const body = await response.json().catch(() => ({}));
+      if (response.status === 401) {
+        setLoggedIn(false);
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(body?.error?.message || `检测失败（HTTP ${response.status}）`);
+      }
+      $('#ch-command').value = body.command ?? '';
+      $('#ch-qoder-args').value = Array.isArray(body.args) ? body.args.join('\n') : '';
+      $('#ch-qoder-env').value = Object.entries(body.env ?? {})
+        .map(([key, value]) => `${key}=${value}`)
+        .join('\n');
+      $('#ch-qoder-mode').value = 'auto';
+      if (body.cliLoginHint) {
+        setProbeStatus(body.cliLoginHint);
+        showToast('Qoder 运行时已填入，但 Qoder CLI 尚未登录');
+      } else {
+        showToast(`已填入 Qoder ${body.version ?? ''}，正在读取模型目录…`);
+      }
+      // 模型名不要求用户猜：检测完直接问 daemon（daemon.get_models）并预填。
+      await autoFillQoderModels();
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      button.disabled = false;
     }
   });
 

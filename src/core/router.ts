@@ -73,10 +73,11 @@ function coolingExhausted(
   attempts: number,
   retries: number,
   waitedMs: number,
+  elapsedMs: number,
 ): GatewayError {
   const detail =
     attempts > 0 || retries > 0
-      ? `（已重试等待 ${retries} 轮共 ${Math.round(waitedMs)}ms，本轮上游尝试 ${attempts} 次）`
+      ? `（已重试等待 ${retries} 轮共 ${Math.round(waitedMs)}ms，总耗时 ${(elapsedMs / 1000).toFixed(1)}s，本轮上游尝试 ${attempts} 次）`
       : '（渠道冷却剩余时长超出单请求等待预算，本轮未尝试上游）';
   return new GatewayError(`${error.message}${detail}`, {
     status: error.status,
@@ -360,13 +361,16 @@ export class Router {
   private exhausted(
     last: { candidate: Candidate; error: UpstreamError } | null,
     attempts: number,
+    elapsedMs?: number,
   ): GatewayError {
     if (!last) {
       return new GatewayError('没有可用的上游尝试', { status: 502, attempts });
     }
     const status = statusFor(last.error);
+    const elapsedPart =
+      elapsedMs !== undefined ? `，总耗时 ${(elapsedMs / 1000).toFixed(1)}s` : '';
     return new GatewayError(
-      `所有渠道均失败（尝试 ${attempts} 次）: ${last.error.message}`,
+      `所有渠道均失败（尝试 ${attempts} 次${elapsedPart}）: ${last.error.message}`,
       {
         status,
         type: typeFor(status),
@@ -389,29 +393,31 @@ export class Router {
     );
   }
 
-  private remainingWait(waitedMs: number): number {
-    return Math.max(0, this.retryPolicy.maxTotalWaitMs - waitedMs);
+  private remainingWait(startedAt: number): number {
+    return Math.max(0, this.retryPolicy.maxTotalWaitMs - (Date.now() - startedAt));
   }
 
   private canRetryFailure(
     error: UpstreamError,
     retries: number,
     attempts: number,
-    waitedMs: number,
+    startedAt: number,
   ): boolean {
     const policy = this.retryPolicy;
     if (!policy.enabled) return false;
     if (retries >= policy.maxRetries) return false;
     if (!policy.retryOn.includes(error.category as RetryCategory)) return false;
     if (attempts >= this.maxTotalAttempts()) return false;
-    return waitedMs < policy.maxTotalWaitMs;
+    // 预算按墙钟计时（含上游尝试本身的耗时）：上游单次尝试动辄几十秒时，
+    // 只累计“睡眠等待”会让一个请求被放大到数分钟才报错。
+    return Date.now() - startedAt < policy.maxTotalWaitMs;
   }
 
   private failureDelay(
     error: UpstreamError,
     candidates: Candidate[],
     retries: number,
-    waitedMs: number,
+    startedAt: number,
   ): number | null {
     const policy = this.retryPolicy;
     let providerDelay =
@@ -431,14 +437,14 @@ export class Router {
       }
     }
     const delay = Math.max(jitteredBackoff(policy, retries + 1), providerDelay);
-    if (delay > this.remainingWait(waitedMs)) return null;
+    if (delay > this.remainingWait(startedAt)) return null;
     return Math.max(1, Math.round(delay));
   }
 
   private coolingDelay(
     error: GatewayError,
     retries: number,
-    waitedMs: number,
+    startedAt: number,
   ): number | null {
     const policy = this.retryPolicy;
     if (!policy.enabled || retries >= policy.maxRetries) return null;
@@ -452,7 +458,7 @@ export class Router {
       jitteredBackoff(policy, retries + 1),
       coolingMs + 100,
     );
-    if (delay > this.remainingWait(waitedMs)) return null;
+    if (delay > this.remainingWait(startedAt)) return null;
     return Math.max(1, Math.round(delay));
   }
 
@@ -474,6 +480,7 @@ export class Router {
     let attempts = 0;
     let retries = 0;
     let waitedMs = 0;
+    const startedAt = Date.now();
 
     for (;;) {
       let candidates: Candidate[];
@@ -481,7 +488,7 @@ export class Router {
         candidates = this.buildCandidates(modelId, requires, estimatedTokens);
       } catch (error) {
         if (error instanceof GatewayError && error.code === 'channels_cooling') {
-          const delay = this.coolingDelay(error, retries, waitedMs);
+          const delay = this.coolingDelay(error, retries, startedAt);
           if (delay !== null) {
             this.retryLog(modelId, delay, retries, waitedMs, '渠道冷却中');
             await sleep(delay, signal);
@@ -489,7 +496,7 @@ export class Router {
             waitedMs += delay;
             continue;
           }
-          throw coolingExhausted(error, attempts, retries, waitedMs);
+          throw coolingExhausted(error, attempts, retries, waitedMs, Date.now() - startedAt);
         }
         throw error;
       }
@@ -516,12 +523,12 @@ export class Router {
       if (!last) {
         throw new GatewayError('没有可用的上游尝试', { status: 502, attempts });
       }
-      if (!this.canRetryFailure(last.error, retries, attempts, waitedMs)) {
-        throw this.exhausted(last, attempts);
+      if (!this.canRetryFailure(last.error, retries, attempts, startedAt)) {
+        throw this.exhausted(last, attempts, Date.now() - startedAt);
       }
-      const delay = this.failureDelay(last.error, candidates, retries, waitedMs);
+      const delay = this.failureDelay(last.error, candidates, retries, startedAt);
       if (delay === null) {
-        throw this.exhausted(last, attempts);
+        throw this.exhausted(last, attempts, Date.now() - startedAt);
       }
       this.retryLog(
         modelId,

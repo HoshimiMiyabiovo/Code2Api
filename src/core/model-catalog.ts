@@ -226,6 +226,7 @@ export class ModelCatalog {
               id: prefix ? `${prefix}${info.id}` : info.id,
               upstream: info.id,
               contextWindow: info.contextWindow,
+              maxOutputTokens: info.maxOutputTokens,
               capabilities: {
                 tools: detected.tools ?? true,
                 vision: detected.vision ?? false,

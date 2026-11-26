@@ -120,8 +120,14 @@ export interface OpenAIProviderConfig extends ProviderBase {
   keys: KeyConfig[];
   /** 是否从上游 /models 拉取模型目录并合并。 */
   syncModels: boolean;
+  /** 自动发现时只保留上游显式标记 isFree:true 的模型；手工模型不受影响。 */
+  freeOnly: boolean;
   /** 对 reasoning 模型默认注入的推理强度（客户端未指定时）。 */
   defaultReasoningEffort?: ReasoningEffort;
+  /** 推理强度写入上游的点号路径；留空使用标准 reasoning_effort。 */
+  reasoningField?: string;
+  /** disabled/none/off 关闭思考时写入 false 的点号路径（如 reasoning.enabled）。 */
+  reasoningOffField?: string;
   /** Anthropic thinking.budget_tokens 透传到上游时的字段路径（支持点号，如 reasoning.max_tokens）。 */
   reasoningBudgetField?: string;
   quota?: QuotaConfig;
@@ -436,7 +442,10 @@ const openAIProviderSchema = z.object({
   timeouts: timeoutsSchema,
   keys: z.array(keySchema).default([]),
   sync_models: z.boolean().default(true),
+  free_only: z.boolean().default(false),
   default_reasoning_effort: reasoningEffortSchema.optional(),
+  reasoning_field: z.string().trim().min(1).max(128).optional(),
+  reasoning_off_field: z.string().trim().min(1).max(128).optional(),
   reasoning_budget_field: z.string().min(1).max(128).optional(),
   quota: quotaSchema,
   keepalive: keepaliveSchema,
@@ -830,7 +839,10 @@ export function parseConfig(raw: unknown): ResolvedConfig {
       },
       keys: resolveKeys(p.id, p.keys),
       syncModels: p.sync_models,
+      freeOnly: p.free_only,
       defaultReasoningEffort: p.default_reasoning_effort,
+      reasoningField: p.reasoning_field,
+      reasoningOffField: p.reasoning_off_field,
       reasoningBudgetField: p.reasoning_budget_field,
       quota: p.quota
         ? {

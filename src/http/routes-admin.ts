@@ -15,12 +15,13 @@ import {
   upsertChannel,
 } from '../core/config-editor.js';
 import { maskKey } from '../core/keys.js';
+import { detectQoderInstall, qoderCliLoginHint } from '../core/qoder-install.js';
 import { guessReasoningModel, matchModelPrefix, withTimeout } from '../core/model-catalog.js';
 import { isSecretEncryptionAvailable, secretBackendLabel } from '../core/secrets.js';
 import type { ProviderMonitorSnapshot } from '../core/pool-supervisor.js';
 import { GatewayError } from '../errors.js';
 import { OpenCodeAdapter, type PendingQuestionView } from '../providers/opencode.js';
-import { QoderAdapter } from '../providers/qoder.js';
+import { QoderAdapter, probeQoderModels } from '../providers/qoder.js';
 import { createAdapter, type ProviderRuntime } from '../providers/registry.js';
 import { ZcodeAdapter } from '../providers/zcode.js';
 import type { ProviderKeyStats } from '../store/db.js';
@@ -117,6 +118,10 @@ function channelView(
       config.type === 'openai-compatible' ? config.tokenLimitField : null,
     sendStreamOptions:
       config.type === 'openai-compatible' ? config.sendStreamOptions : null,
+    freeOnly: config.type === 'openai-compatible' ? config.freeOnly : null,
+    reasoningField: config.type === 'openai-compatible' ? config.reasoningField ?? null : null,
+    reasoningOffField:
+      config.type === 'openai-compatible' ? config.reasoningOffField ?? null : null,
     userAgent: config.type === 'openai-compatible' ? config.userAgent ?? null : null,
     modelsUrl: config.type === 'openai-compatible' ? config.modelsUrl ?? null : null,
     sessionHeader:
@@ -302,6 +307,39 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: GatewayContext): 
     },
   );
 
+  // 立即解除所有渠道密钥的冷却（含连续失败计数），用于上游限流恢复后手动放行。
+  app.post(
+    '/admin/api/maintenance/clear-cooldowns',
+    { preHandler: adminGuard },
+    async (_request: FastifyRequest, reply: FastifyReply) => {
+      let cleared = 0;
+      for (const provider of ctx.registry.providers) {
+        cleared += provider.keys.clearCooldowns();
+      }
+      return reply.send({ ok: true, cleared });
+    },
+  );
+
+  // 面板「检测本机 Qoder」：只读扫描安装目录，返回可直接填入表单的 command/args/env。
+  app.get(
+    '/admin/api/qoder/detect',
+    { preHandler: adminGuard },
+    async (_request: FastifyRequest, reply: FastifyReply) => {
+      const found = detectQoderInstall();
+      if (!found) {
+        return reply.code(404).send({
+          error: {
+            message:
+              '未找到本机 Qoder 安装；请在面板手工填写 Qoder.exe 与 qoder-worker-runtime.obf.mjs 路径',
+            type: 'invalid_request_error',
+            code: 'qoder_not_found',
+          },
+        });
+      }
+      return reply.send({ ok: true, ...found, cliLoginHint: qoderCliLoginHint() });
+    },
+  );
+
   app.post(
     '/admin/api/channels',
     { preHandler: adminGuard },
@@ -338,11 +376,40 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: GatewayContext): 
             code: 'config_invalid',
           });
         }
-        if (config.type === 'zcode' || config.type === 'qoder') {
+        if (config.type === 'zcode') {
           throw new GatewayError(
-            `${config.type} 渠道没有模型目录可探测（CLI 协议不支持），请手工填写 providerId/modelId`,
+            `zcode 渠道没有模型目录可探测（CLI 协议不支持），请手工填写 providerId/modelId`,
             { status: 400, type: 'invalid_request_error', code: 'config_invalid' },
           );
+        }
+        if (config.type === 'qoder') {
+          // qoder 的模型目录在 daemon 侧（daemon.get_models）：临时拉起 CLI 读一次，不建会话、不耗模型额度。
+          const infos = await withTimeout(
+            probeQoderModels(config, 20000),
+            120000,
+            `qoder 渠道 ${config.id} 模型探测`,
+          ).catch((error: unknown) => {
+            throw new GatewayError(`qoder 模型探测失败：${(error as Error).message}`, {
+              status: 502,
+              type: 'upstream_error',
+            });
+          });
+          return reply.send({
+            ok: true,
+            models: infos.map((info) => ({
+              // 对外名用 runtime 的 modelId；displayName 只做候选按钮的标签。
+              id: info.id,
+              upstream: info.id,
+              label:
+                info.displayName && info.displayName !== info.id
+                  ? `${info.displayName}（${info.id}）`
+                  : info.id,
+              contextWindow: info.contextWindow ?? null,
+              maxOutputTokens: info.maxOutputTokens ?? null,
+              capabilities: { tools: true, vision: info.vision, reasoning: info.reasoning },
+              default: info.isDefault,
+            })),
+          });
         }
         const adapter = createAdapter(config, ctx.store);
         try {
@@ -393,7 +460,7 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: GatewayContext): 
                 id: prefix ? `${prefix}${info.id}` : info.id,
                 upstream: info.id,
                 contextWindow: info.contextWindow ?? null,
-                maxOutputTokens: null,
+                maxOutputTokens: info.maxOutputTokens ?? null,
                 capabilities: {
                   tools: detected.tools ?? true,
                   vision: detected.vision ?? false,
