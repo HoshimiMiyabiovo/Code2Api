@@ -48,11 +48,14 @@ const state = {
   sessionArgs: [],
   closes: [],
   auth: [],
+  initializeRequests: 0,
   // 记录网关注入到 CLI 子进程的环境变量（验证渠道 env 配置确实生效）
   cliEnv: {
     QODER_AGENT_SDK_DAEMON: process.env.QODER_AGENT_SDK_DAEMON ?? null,
     QODER_PERSONAL_ACCESS_TOKEN: process.env.QODER_PERSONAL_ACCESS_TOKEN ?? null,
     ELECTRON_RUN_AS_NODE: process.env.ELECTRON_RUN_AS_NODE ?? null,
+    QODER_SDK_AUTH_PAYLOAD_FILE: process.env.QODER_SDK_AUTH_PAYLOAD_FILE ?? null,
+    QODER_SDK_AUTH_CONFIG_DIR: process.env.QODER_SDK_AUTH_CONFIG_DIR ?? null,
   },
 };
 function flushState() {
@@ -249,12 +252,16 @@ async function handleRequest(requestId, request, sessionId) {
         return;
       }
       state.cliEnvChecked = true;
+      state.initializeRequests += 1;
       flushState();
-      respond(requestId, {
-        daemon_protocol_version: 2,
-        daemon_version: '1.1.86-hotfix.17',
-        capabilities: ['multi_session_v2', 'session_delete_v1', 'daemon_queries_v1'],
-      });
+      const reply = () =>
+        respond(requestId, {
+          daemon_protocol_version: 2,
+          daemon_version: '1.1.86-hotfix.17',
+          capabilities: ['multi_session_v2', 'session_delete_v1', 'daemon_queries_v1'],
+        });
+      if (scenario.initializeDelayMs) setTimeout(reply, scenario.initializeDelayMs);
+      else reply();
       return;
     }
     if (type === 'daemon.authenticate') {

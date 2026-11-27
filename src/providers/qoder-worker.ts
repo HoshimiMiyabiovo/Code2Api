@@ -275,10 +275,15 @@ export class QoderWorker {
     );
     let child: ChildProcess;
     try {
+      // Qoder IDE 会给子进程注入它自己的 SDK auth payload 路径；网关继承后
+      // runtime 会去找那个临时文件，而不是 ~/.qoder 里的 CLI 登录态。
+      const childEnv: NodeJS.ProcessEnv = { ...process.env };
+      delete childEnv.QODER_SDK_AUTH_PAYLOAD_FILE;
+      delete childEnv.QODER_SDK_AUTH_CONFIG_DIR;
       child = spawn(this.config.command, baseArgs, {
         cwd: workspace,
         env: {
-          ...process.env,
+          ...childEnv,
           ...this.config.env,
           // SDK 以此判定 daemon 模式（IDE 拉起时同样注入）
           QODER_AGENT_SDK_DAEMON: '1',
@@ -354,44 +359,30 @@ export class QoderWorker {
   }
 
   private async waitReady(): Promise<void> {
-    const deadline = Date.now() + this.config.startupTimeoutMs;
-    let lastError: Error | null = null;
-    while (Date.now() < deadline) {
+    if (!this.child) {
+      throw new Error(this.lastError ?? 'qoder 进程已退出');
+    }
+    try {
+      // daemon.initialize 不是幂等操作：0.5.21 冷启动可能超过 10 秒，
+      // 超时后重发会收到 "initialization is already in progress"。
+      // 因此单次使用完整启动预算等待，不重试。
+      await this.dispatch(
+        'daemon.initialize',
+        {
+          daemon_protocol_version: DAEMON_PROTOCOL_VERSION,
+          sdk_version: 'code2api-gateway',
+          capabilities: ['multi_session_v2', 'session_delete_v1', 'daemon_queries_v1'],
+        },
+        { timeoutMs: this.config.startupTimeoutMs },
+      );
+    } catch (error) {
       if (!this.child) {
         throw new Error(this.lastError ?? 'qoder 进程已退出');
       }
-      try {
-        await this.dispatch(
-          'daemon.initialize',
-          {
-            daemon_protocol_version: DAEMON_PROTOCOL_VERSION,
-            sdk_version: 'code2api-gateway',
-            capabilities: ['multi_session_v2', 'session_delete_v1', 'daemon_queries_v1'],
-          },
-          { timeoutMs: 8000 },
-        );
-        return;
-      } catch (error) {
-        if (!this.child) {
-          throw new Error(this.lastError ?? 'qoder 进程已退出');
-        }
-        lastError = error as Error;
-        // 超时可能是 CLI 还在初始化：重试直到 startupTimeoutMs；
-        // 其余（含协议 error 应答：认证失败/版本不支持等）直接判启动失败，保留诊断信息。
-        if (
-          !(error instanceof UpstreamError) ||
-          error.category !== 'timeout'
-        ) {
-          throw error;
-        }
-        await sleep(300);
-      }
+      throw new Error(
+        `qoder daemon 未在 ${this.config.startupTimeoutMs}ms 内就绪: ${(error as Error).message}`,
+      );
     }
-    throw new Error(
-      lastError
-        ? `qoder daemon 未在 ${this.config.startupTimeoutMs}ms 内就绪: ${lastError.message}`
-        : `qoder daemon 未在 ${this.config.startupTimeoutMs}ms 内就绪`,
-    );
   }
 
   /**

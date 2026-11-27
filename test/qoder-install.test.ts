@@ -63,12 +63,29 @@ test('qoder CLI 凭据提示区分 IDE 登录与 CLI 登录', () => {
     const paths = qoderCliCredentialPaths(env);
     assert.ok(paths.includes(join(root, 'qoder-cli-credentials.json')));
     assert.ok(paths.includes(join(root, 'qoder-cli-cn-credentials.json')));
+    assert.ok(paths.includes(join(root, '.auth', 'user')));
     const hint = qoderCliLoginHint(env);
     assert.ok(hint);
     assert.match(hint, /IDE 登录不等于 CLI 登录/);
     assert.match(hint, /QODER_PERSONAL_ACCESS_TOKEN/);
 
     writeFileSync(paths[0]!, '');
+    assert.equal(qoderCliLoginHint(env), null);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('qoder CLI 1.1.100 的 .auth/user 登录态可识别', () => {
+  const root = mkdtempSync(join(tmpdir(), 'code2api-qoder-auth-'));
+  const env = {
+    QODER_CONFIG_DIR: root,
+    QODER_HOME: root,
+    USERPROFILE: root,
+  } as NodeJS.ProcessEnv;
+  try {
+    mkdirSync(join(root, '.auth'), { recursive: true });
+    writeFileSync(join(root, '.auth', 'user'), 'encrypted');
     assert.equal(qoderCliLoginHint(env), null);
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -542,3 +542,48 @@ test('qoder 无本地 CLI 凭据时错误给出登录指引', async () => {
     rmSync(emptyHome, { recursive: true, force: true });
   }
 });
+
+test('qoder 子进程不继承 IDE 注入的 SDK auth payload 环境', async () => {
+  const previousPayload = process.env.QODER_SDK_AUTH_PAYLOAD_FILE;
+  const previousDir = process.env.QODER_SDK_AUTH_CONFIG_DIR;
+  process.env.QODER_SDK_AUTH_PAYLOAD_FILE = join(tmpdir(), 'stale-qoder-auth', 'payload.json');
+  process.env.QODER_SDK_AUTH_CONFIG_DIR = join(tmpdir(), 'stale-qoder-auth');
+  let harness: Harness | null = null;
+  try {
+    harness = await startGateway({ scenario: { deltas: ['ok'] } });
+    const response = await chat(harness, {
+      model: 'qd-test',
+      messages: [{ role: 'user', content: 'ping' }],
+    });
+    assert.equal(response.status, 200);
+    const data = await readState(harness);
+    assert.equal(data.cliEnv.QODER_SDK_AUTH_PAYLOAD_FILE, null);
+    assert.equal(data.cliEnv.QODER_SDK_AUTH_CONFIG_DIR, null);
+    assert.equal(data.cliEnv.QODER_AGENT_SDK_DAEMON, '1');
+  } finally {
+    if (harness) await harness.close();
+    if (previousPayload === undefined) delete process.env.QODER_SDK_AUTH_PAYLOAD_FILE;
+    else process.env.QODER_SDK_AUTH_PAYLOAD_FILE = previousPayload;
+    if (previousDir === undefined) delete process.env.QODER_SDK_AUTH_CONFIG_DIR;
+    else process.env.QODER_SDK_AUTH_CONFIG_DIR = previousDir;
+  }
+});
+
+test('qoder 冷启动超过 8 秒时不重发 daemon.initialize', async () => {
+  const harness = await startGateway({
+    scenario: { deltas: ['slow-ok'], initializeDelayMs: 9000 },
+  });
+  try {
+    const response = await chat(harness, {
+      model: 'qd-test',
+      messages: [{ role: 'user', content: 'slow-start' }],
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.choices[0].message.content, 'slow-ok');
+    const data = await readState(harness);
+    assert.equal(data.initializeRequests, 1, 'initialize 非幂等，不能超时重发');
+  } finally {
+    await harness.close();
+  }
+});

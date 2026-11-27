@@ -37,7 +37,11 @@ export function qoderInstallRoots(env: NodeJS.ProcessEnv = process.env): string[
   return [...roots];
 }
 
-const CLI_CREDENTIAL_FILES = ['qoder-cli-credentials.json', 'qoder-cli-cn-credentials.json'];
+const CLI_CREDENTIAL_FILES = [
+  'qoder-cli-credentials.json',
+  'qoder-cli-cn-credentials.json',
+  join('.auth', 'user'),
+];
 
 /** Qoder CLI 的 scrypt 登录凭据位置；IDE 登录态不在这里，两者互不通用。 */
 export function qoderCliCredentialPaths(env: NodeJS.ProcessEnv = process.env): string[] {
@@ -53,7 +57,7 @@ export function qoderCliCredentialPaths(env: NodeJS.ProcessEnv = process.env): s
 export function qoderCliLoginHint(env: NodeJS.ProcessEnv = process.env): string | null {
   const paths = qoderCliCredentialPaths(env);
   if (paths.some((path) => existsSync(path))) return null;
-  return `未找到 ${paths[0] ?? 'qoder-cli-credentials.json'}（或 CN 版本）；IDE 登录不等于 CLI 登录，请安装 Qoder CLI 并执行 qodercli login；或为网关进程设置 QODER_PERSONAL_ACCESS_TOKEN / QODERCN_PERSONAL_ACCESS_TOKEN 环境变量（勿在面板填写明文）`;
+  return `未找到 CLI 登录态（${paths[0] ?? 'qoder-cli-credentials.json'} / .auth/user）；IDE 登录不等于 CLI 登录，请安装 Qoder CLI 并执行 qodercli login；或为网关进程设置 QODER_PERSONAL_ACCESS_TOKEN / QODERCN_PERSONAL_ACCESS_TOKEN 环境变量（勿在面板填写明文）`;
 }
 
 function versionScore(version: string): number[] {
